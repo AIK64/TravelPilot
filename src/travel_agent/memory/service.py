@@ -217,6 +217,11 @@ class PreferenceMemoryService:
             scope=request.scope,
             scope_key=request.scope_key,
         )
+        pending = await self.repository.find_pending_proposal(
+            principal.tenant_id, principal.user_id, content_hash
+        )
+        if pending is not None:
+            return pending
         proposal = MemoryProposal(
             tenant_id=principal.tenant_id,
             user_id=principal.user_id,

@@ -5,6 +5,7 @@ import logging
 
 import pytest
 
+from travel_agent.identity.models import Principal
 from travel_agent.domain.tool_models import POIFacts, POISearchQuery
 from travel_agent.requirements.gateway import RequirementGateway
 from travel_agent.requirements.errors import (
@@ -25,6 +26,9 @@ from travel_agent.requirements.workflow import (
 )
 from travel_agent.tools.errors import ToolProviderError, ToolUnavailableError
 from travel_agent.tools.providers.mock import MockRouteProvider
+from travel_agent.memory.models import PreferenceLearningStatus
+from travel_agent.memory.repository import InMemoryPreferenceRepository
+from travel_agent.memory.service import PreferenceMemoryService
 
 
 COMPLETE_TEXT = (
@@ -117,6 +121,73 @@ async def test_complete_requirement_trajectory_reaches_existing_planning_graph(
     assert snapshot.values["anchor_resolutions"]["arrival"].provider == "mock"
     assert snapshot.values["llm_summaries"][0].provider == "mock"
     assert snapshot.values["planning_response"].status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_completed_plan_creates_confirmable_memory_proposals(
+    workflow_harness,
+):
+    memory_service = PreferenceMemoryService(InMemoryPreferenceRepository())
+    workflow = build_requirement_workflow(
+        requirement_gateway=_requirement_gateway(),
+        tool_gateway=workflow_harness.gateway,
+        planning_workflow=workflow_harness.workflow,
+        memory_service=memory_service,
+    )
+
+    response = await run_natural_planning(
+        workflow,
+        NaturalPlanningRequest(
+            text=COMPLETE_TEXT,
+            reference_date=date(2026, 8, 23),
+        ),
+        thread_id="natural-memory-extraction",
+        tenant_id="tenant-a",
+        user_id="user-a",
+    )
+
+    assert response.status == "completed"
+    assert response.preference_learning_status is PreferenceLearningStatus.COMPLETED
+    assert response.memory_proposals
+    assert (await memory_service.list(
+        Principal(tenant_id="tenant-a", user_id="user-a")
+    )).items == ()
+
+
+class FailingPreferenceRepository(InMemoryPreferenceRepository):
+    async def find_content_hash(
+        self, tenant_id: str, user_id: str, content_hash: str
+    ):
+        raise RuntimeError("simulated memory repository failure")
+
+
+@pytest.mark.asyncio
+async def test_preference_learning_failure_does_not_fail_completed_plan(
+    workflow_harness,
+):
+    memory_service = PreferenceMemoryService(FailingPreferenceRepository())
+    workflow = build_requirement_workflow(
+        requirement_gateway=_requirement_gateway(),
+        tool_gateway=workflow_harness.gateway,
+        planning_workflow=workflow_harness.workflow,
+        memory_service=memory_service,
+    )
+
+    response = await run_natural_planning(
+        workflow,
+        NaturalPlanningRequest(
+            text=COMPLETE_TEXT,
+            reference_date=date(2026, 8, 23),
+        ),
+        thread_id="natural-memory-degraded",
+        tenant_id="tenant-a",
+        user_id="user-a",
+    )
+
+    assert response.status == "completed"
+    assert response.planning is not None
+    assert response.preference_learning_status is PreferenceLearningStatus.DEGRADED
+    assert response.memory_proposals == []
 
 
 @pytest.mark.asyncio

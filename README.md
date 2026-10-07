@@ -1,26 +1,25 @@
 # Constraint-Aware Travel Agent
 
-面向中国城市旅行场景的约束感知规划 Agent。v1.2 在 v1.0 的 Requirement、Planning、Lifecycle/HITL 与 Weather Replanning 基线上，加入长期 Preference Memory、上下文裁剪、进程内 Specialist Handoff、真实 Provider Failover、Travel MCP、异步 Run/SSE、核心演示前端与生产部署适配。核心仍是显式 `Plan → Tool Use → Validate/Critic → Replan` Agent Loop，而不是地图或前端工程堆叠。
+面向中国城市旅行场景的约束感知规划 Agent。v1.3 在 Requirement、Planning、Lifecycle/HITL、Weather Replanning 与 Preference Memory 基线上，引入由 LLM Planner Action 驱动的动态状态转移：模型根据 Evidence Gap 和 Observation 选择工具、求解、修复或结束，确定性 Guard、OR-Tools、Repair Policy、Hard Validator 与 Final Guard 继续承担安全边界。核心是可观察的 `Observe → Decide → Act → Validate → Replan` 有界循环，而不是地图或前端工程堆叠。
 
-## 当前进度：v1.2.0
+## 当前进度：v1.3.0
 
 ```text
 Natural Language
-  → RunCoordinator / Shared ExecutionBudget / Safe Trace
-  → Parse Requirement
-  → Deterministic Validate
-  → Interrupt ↔ Resume Clarification Patch
-  → Anchor Tool Use / Cached Resolution Reuse
+  → Requirement Graph / Interrupt ↔ Resume / Confirmed Memory
   → Assemble TripSpec
-  → Build Driving/Walking Route Matrix
-  → Build OptimizationProblem → Solve Style Variants
-  → Materialize Candidate Plans → Hard Validate
-      ├─ deliverable → Evidence Digest → LLM Soft Critic → Grounding Gate
-      │                  → Deterministic Quality Gate
-      │                    ├─ Select + Grounded Explanation
-      │                    └─ One Soft Repair → Route Delta → Hard Validate → Re-evaluate
-      └─ invalid → Select Target → Critic → RepairPlan
-                   → Local Repair → Delta Route Tool Use → Revalidate
+  → Dynamic Planner Context
+      → Evidence Gap + Recent Observation + Candidate/Violation Summary + Budget
+  → PlannerDecision (Clarify / CallTool / Solve / Repair / Finish / Escalate)
+  → Action Guard
+      ├─ CallTool → Registry → Reliable Gateway → Evidence / Observation → Decide
+      ├─ Solve → PlanningKernelService → OR-Tools → Materialize → Hard Validate
+      │          → Grounded Soft Critic → Quality Gate → Decide
+      ├─ Repair → Replanner Proposal → Policy → Patch → Route Delta
+      │            → Materialize → Hard Revalidate → Decide
+      ├─ Soft Repair → QualityReviewService → Safe Patch → Route Delta
+      │                 → Hard Revalidate → Re-review → Accept / Restore Baseline
+      └─ Finish → Final Guard → Deliver
   → Candidate Selection Interrupt → Persist V1
   → Lock / Edit Intent → Grounding → Impact / Lock Guard
   → Local Preview → POI/Route Delta → Hard Validate / Soft Critic
@@ -36,6 +35,8 @@ Natural Language
                              → Hard Validate → Preview → Approval
   → RunTerminalReason / Usage / Trace API / Release Gate
 ```
+
+生产默认使用 `dynamic_planner`。工具选择、求解、硬修复、Grounded Soft Critic、Soft Repair、质量比较和计划生命周期创建均已进入新链路，不再调用固定 Planning Graph。`fixed_workflow` 只作为可显式选择的历史基线、Shadow 主结果和消融评测对象保留。详细迁移轨迹见 [v1.3 LLM 状态转移迁移记录](docs/v1.3/llm-state-transition-migration.md)。
 
 已完成：
 
@@ -96,14 +97,35 @@ Natural Language
 - 刷新、天气状态和事件查询 API；Provider 失败返回 503 并保留 Active Version，不会被伪装成 `infeasible` 或天气良好。
 - 30 条固定天气 Fixture；当前离线 Mock 基线 Event F1、Impact Exact Match、锁与未影响日保持率均为 100%，路线复用率为 66.41%。
 
-当前边界：不实现 OTA 库存或交易，不把 Agent 拆成分布式自治服务；Specialist 是进程内强类型 Handoff，用于 Planner/Critic/Replanner 上下文隔离，Orchestrator 仍拥有唯一路由和终止权。真实 Provider Live Smoke、Docker 全栈演练与 LLM 软评测需要调用者自行提供凭证，默认测试不会产生外部费用。
+当前边界：v1.3 已完成生产规划功能向模型驱动链路的迁移。Planner 决定补证、求解、修复或结束；Replanner 的合规 `PlanPatch` 会真实落地并经过增量路线补查和硬约束复验；Grounded Critic、Soft Repair 与质量择优也在动态 Graph 中显式执行。动态 Graph 已接入进程内 Checkpoint，但 Evidence 与 Checkpoint 的跨进程持久化仍是后续可靠性增强。真实 Provider Live Smoke、Docker 全栈演练与 LLM 软评测仍需要调用者提供凭证，默认测试不会产生外部费用。
 
-本机最终门禁收集 565 项测试，563 项通过，2 项真实 Provider Live Smoke 因未显式启用而跳过；statement + branch 综合覆盖率为 90.0177%。前端 `npm run build` 通过。当前环境没有 Docker CLI，因此 Compose 仅完成代码、配置和 Repository/Queue Contract 验证，尚未在本机做容器级 Smoke。
+当前 Python 门禁收集 590 项测试，588 项通过，2 项真实 Provider Live Smoke 因未显式启用而跳过；14,584 条 statement 覆盖率为 88%。这些结果证明当前离线测试集通过，不等同于已完成真实 Provider 或容器级联调。
+
+## 查看运行 Trace 文本
+
+后端默认将每次运行的安全 Trace 同时追加到 `.data/traces/<run_id>.log`。从项目根目录启动时，文件位于 `D:\Code\LearnAgent\.data\traces\`；页面“执行轨迹”下方的 `run_id` 与文件名对应，终端也会打印 `agent_run.trace_file_created` 和文件路径。
+
+文件使用 UTF-8，每行一个 JSON 记录，可直接用记事本或 VS Code 打开。普通 Trace 包含时间戳、sequence、Node、Tool、耗时、状态与安全属性；有结构化输入输出的动作还会紧接着追加 `record_type=action_io` 调试记录，包含 `details.request` 和/或 `details.result`。运行中即可查看，完成、失败或取消时会排空当前事件队列；时间戳使用 UTC。PowerShell 实时查看示例：
+
+```powershell
+Get-Content -Encoding utf8 -Wait .data/traces/<run_id>.log
+```
+
+可在 `.env` 中配置（启动时需要加载该文件）：
+
+```dotenv
+TRACE_FILE_ENABLED=true
+TRACE_FILE_DIR=.data/traces
+```
+
+文本输出独立于 `RUN_STORE_BACKEND`，使用 Memory 或 SQLite 都会写入。设置 `TRACE_FILE_ENABLED=false` 可关闭。支持的调试正文包括 POI 搜索的城市、关键词、类型与返回 POI JSON，路线查询的起终点与距离/时间结果，天气查询的地点、日期与结果，以及动态 Planner 的结构化上下文、决策动作与工具 Observation。成功、缓存命中和失败均记录标准化 ToolResult；第三方原始 HTTP 响应和实际 LLM Prompt 不在此输出范围内。
+
+`action_io` 通过 `trace_event_id`、`trace_sequence` 和 `parent_event_id` 关联普通 Trace，不占用额外事件序号，也不将正文写入 Graph State、Trace API 或 SQLite。调试正文递归脱敏 Key、认证头、Token、身份等字段；单条正文超过 128 Ki 个字符时标记 `truncated` 并保存预览。原有 Trace 事件数量上限仍有效；文件写入失败时记录错误并将 Trace 标记为降级，不终止规划。每个 Run 单独保存，旧文件需自行清理。
 
 ## 学习入口
 
-- 从 [v1.2 实现与使用指南](docs/v1.1-v1.2/implementation.md) 查看 Memory、Specialist、异步 API、MCP、Baidu/QWeather、前端、Worker 与生产部署的实际入口。
-- 后续开发以 [v1.1 → v1.2 最终开发入口](docs/v1.1-v1.2/README.md) 为准；[统一设计报告](docs/v1.1-v1.2/design.md) 和 [需求追踪矩阵](docs/v1.1-v1.2/requirements-traceability.md) 已冻结一次连续实现、两个内部 Gate、最终发布 v1.2.0 的范围。
+- 从 [v1.3 LLM 状态迁移实现记录](docs/v1.3/llm-state-transition-migration.md) 学习这次从确定性工作流到模型决策闭环的具体改造、代码落点、状态变化和测试证据；[v1.3 实施说明](docs/v1.3/implementation.md) 提供运行与配置入口。
+- [v1.1 → v1.2 最终开发入口](docs/v1.1-v1.2/README.md)、[统一设计报告](docs/v1.1-v1.2/design.md) 和 [需求追踪矩阵](docs/v1.1-v1.2/requirements-traceability.md) 作为历史阶段资料保留，用于理解 Memory、Specialist、异步 API、MCP、Provider、前端和 Worker 的演进过程。
 - 历史版本边界和共同守则见 [v0.9 → v1.2 权威迭代路线](docs/roadmap-to-v1.2.md)。
 - 从 [v1.0 实现文档](docs/v1.0/README.md) 查看 Run/Trace API、预算、DeepSeek/地图配置、发布门禁和消融结果；完整取舍见 [设计报告](docs/v1.0/design.md)。
 - 从 [v0.9 天气事件驱动局部重规划文档](docs/v0.9/README.md) 查看配置、API、Graph、失败语义和实际离线评测结果；完整取舍见 [设计报告](docs/v0.9/design.md)。

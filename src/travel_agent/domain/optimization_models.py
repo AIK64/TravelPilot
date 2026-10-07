@@ -33,6 +33,7 @@ class ObjectiveWeights(BaseModel):
     diversity: int = Field(ge=0)
     travel: int = Field(ge=0)
     cost: int = Field(ge=0)
+    proximity: int = Field(default=4, ge=0)
 
 
 class OptimizationPOI(BaseModel):
@@ -93,6 +94,7 @@ class ObjectiveBreakdown(BaseModel):
     travel_minutes: int = Field(ge=0)
     walking_meters: int = Field(ge=0)
     known_cost: Decimal = Field(ge=0)
+    proximity_score: int = Field(default=0, ge=0)
 
 
 class OptimizationSolution(BaseModel):

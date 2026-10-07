@@ -14,7 +14,16 @@ from travel_agent.requirements.models import (
     RequirementIssue,
     RequirementPatch,
 )
-from travel_agent.memory.models import PreferenceContext
+from travel_agent.memory.extraction import (
+    ExtractedPreferenceCandidate,
+    PreferenceEvidence,
+    RejectedPreferenceCandidate,
+)
+from travel_agent.memory.models import (
+    MemoryProposal,
+    PreferenceContext,
+    PreferenceLearningStatus,
+)
 
 
 class RequirementState(TypedDict):
@@ -45,5 +54,12 @@ class RequirementState(TypedDict):
     preference_context: PreferenceContext | None
     personalized_fields: list[str]
     planning_response: PlanningResponse | None
+    preference_evidence: list[PreferenceEvidence]
+    extracted_preference_candidates: list[ExtractedPreferenceCandidate]
+    accepted_preference_candidates: list[ExtractedPreferenceCandidate]
+    rejected_preference_candidates: list[RejectedPreferenceCandidate]
+    memory_proposals: list[MemoryProposal]
+    preference_learning_status: PreferenceLearningStatus
+    preference_deduplicated_count: int
     status: str
     message: str | None

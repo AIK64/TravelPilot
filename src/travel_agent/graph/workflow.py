@@ -15,10 +15,12 @@ from travel_agent.agents.contracts import HandoffReason
 from travel_agent.agents.orchestrator import SpecialistExecutor
 from travel_agent.config import AgentMode
 from travel_agent.domain.models import (
+    DayBoundary,
     PlanCandidate,
     PlanningRequest,
     PlanningResponse,
     POIResolutionIssue,
+    StayAnchorResolution,
     TripSpec,
     ValidationStatus,
 )
@@ -66,7 +68,11 @@ from travel_agent.execution.instrumentation import (
     instrument_node,
     instrument_route,
 )
-from travel_agent.execution.context import record_degradation
+from travel_agent.execution.context import (
+    record_day_boundaries,
+    record_degradation,
+    record_stay_resolution,
+)
 from travel_agent.execution.errors import ExecutionBudgetExceeded
 from travel_agent.planning.critic import (
     analyze_candidate,
@@ -93,6 +99,8 @@ from travel_agent.planning.soft_repair import (
     compile_soft_repair_plan as create_soft_repair_plan,
 )
 from travel_agent.planning.search_plan import build_search_plan as create_search_plan
+from travel_agent.planning.search_plan import select_search_candidates
+from travel_agent.planning.stay import derive_day_boundaries, resolve_stay_anchor
 from travel_agent.planning.validator import validate_candidate
 from travel_agent.tools.errors import ToolUnavailableError
 from travel_agent.tools.gateway import ToolGateway
@@ -105,11 +113,15 @@ _DELIVERABLE_STATUSES = {
     ValidationStatus.VALID_WITH_WARNINGS,
 }
 _CHECKPOINT_ALLOWED_TYPES = (
+    ("travel_agent.domain.models", "DayBoundary"),
     ("travel_agent.domain.models", "ItemType"),
     ("travel_agent.domain.models", "Pace"),
     ("travel_agent.domain.models", "PlanCandidate"),
+    ("travel_agent.domain.models", "PlanRouteLeg"),
     ("travel_agent.domain.models", "PlanStyle"),
     ("travel_agent.domain.models", "PlanningPOI"),
+    ("travel_agent.domain.models", "StayAnchorMode"),
+    ("travel_agent.domain.models", "StayAnchorResolution"),
     ("travel_agent.domain.models", "POIResolutionIssue"),
     ("travel_agent.domain.models", "TripSpec"),
     ("travel_agent.domain.models", "ValidationStatus"),
@@ -421,8 +433,13 @@ def build_workflow(
     """构建只通过注入 ToolGateway 获取外部事实的异步规划图。"""
 
     eval_overrides = evaluation_overrides or PlanningEvaluationOverrides()
-    use_specialists = agent_mode is not AgentMode.SINGLE_GRAPH
-    specialists = specialist_executor or SpecialistExecutor()
+    use_specialists = agent_mode in {
+        AgentMode.SPECIALIST_SUBAGENTS,
+        AgentMode.SHADOW_SUBAGENTS,
+    }
+    specialists = (
+        specialist_executor or SpecialistExecutor() if use_specialists else None
+    )
 
     async def build_search_plan(state: TravelState) -> dict:
         _log_node_started(state, "build_search_plan")
@@ -432,6 +449,7 @@ def build_workflow(
             max_queries=policy.poi_max_queries,
         )
         if use_specialists:
+            assert specialists is not None
             queries, _ = await specialists.invoke(
                 role=AgentRole.PLANNER,
                 reason=HandoffReason.PLAN,
@@ -470,29 +488,21 @@ def build_workflow(
 
     async def load_pois(state: TravelState) -> dict:
         _log_node_started(state, "load_pois")
-        results = await gateway.search_pois(
-            state["search_queries"],
-            ToolCallContext(thread_id=state["thread_id"]),
-        )
+        context = ToolCallContext(thread_id=state["thread_id"])
+        required = [query for query in state["search_queries"] if query.exact_match]
+        ordinary = [query for query in state["search_queries"] if not query.exact_match]
+        results = []
+        for query in required:
+            result = (await gateway.search_pois([query], context))[0]
+            if result.status is ToolStatus.FAILED:
+                raise ToolUnavailableError.from_result(result, state["thread_id"])
+            results.append(result)
+        results.extend(await gateway.search_pois(ordinary, context))
         for result in results:
             if result.status is ToolStatus.FAILED:
                 raise ToolUnavailableError.from_result(result, state["thread_id"])
 
-        ordered = sorted(
-            enumerate(zip(state["search_queries"], results, strict=True)),
-            key=lambda item: (-item[1][0].priority, item[0]),
-        )
-        facts_by_id: dict[str, POIFacts] = {}
-        for _, (_, result) in ordered:
-            assert result.data is not None
-            for facts in result.data:
-                facts_by_id.setdefault(facts.id, facts)
-                if len(facts_by_id) == policy.poi_candidate_limit:
-                    break
-            if len(facts_by_id) == policy.poi_candidate_limit:
-                break
-
-        poi_facts = list(facts_by_id.values())
+        poi_facts = select_search_candidates([*required, *ordinary], results, max_candidates=policy.poi_candidate_limit)
         summaries = [
             _tool_summary(result, "poi.search")
             for result in results
@@ -551,6 +561,50 @@ def build_workflow(
             "status": "poi_context_loaded",
         }
 
+    def resolve_stay_anchor_node(state: TravelState) -> dict:
+        _log_node_started(state, "resolve_stay_anchor")
+        resolution = resolve_stay_anchor(state["trip"], state["planning_pois"])
+        record_stay_resolution(
+            mode=resolution.mode.value,
+            confidence=resolution.confidence,
+            confirmed=resolution.confirmed,
+            candidate_count=len(resolution.reference_poi_ids),
+        )
+        logger.info(
+            "stay_anchor.resolved | thread_id=%s mode=%s confidence=%s "
+            "confirmed=%s candidate_count=%s",
+            state["thread_id"], resolution.mode.value, resolution.confidence,
+            resolution.confirmed, len(resolution.reference_poi_ids),
+        )
+        _log_node_completed(
+            state, "resolve_stay_anchor", "stay_anchor_resolved",
+            mode=resolution.mode.value,
+        )
+        return {"stay_resolution": resolution, "status": "stay_anchor_resolved"}
+
+    def derive_day_boundaries_node(state: TravelState) -> dict:
+        _log_node_started(state, "derive_day_boundaries")
+        resolution = state["stay_resolution"]
+        if resolution is None:
+            raise RuntimeError("day boundaries require stay resolution")
+        boundaries = derive_day_boundaries(state["trip"], resolution)
+        record_day_boundaries(
+            day_count=len(boundaries),
+            start_role=boundaries[0].start_role,
+            end_role=boundaries[-1].end_role,
+        )
+        logger.info(
+            "day_boundaries.resolved | thread_id=%s day_count=%s "
+            "start_role=%s end_role=%s",
+            state["thread_id"], len(boundaries), boundaries[0].start_role,
+            boundaries[-1].end_role,
+        )
+        _log_node_completed(
+            state, "derive_day_boundaries", "day_boundaries_resolved",
+            day_count=len(boundaries),
+        )
+        return {"day_boundaries": boundaries, "status": "day_boundaries_resolved"}
+
     class _ForcedHeuristicOptimizer:
         name = "evaluation-forced-heuristic"
 
@@ -576,6 +630,8 @@ def build_workflow(
             modes=policy.route_modes,
             strategy=policy.route_strategy,
             max_walking_leg_meters=policy.max_walking_leg_meters,
+            stay_resolution=state["stay_resolution"],
+            day_boundaries=state["day_boundaries"],
         )
         results = await gateway.get_routes(
             queries,
@@ -638,6 +694,8 @@ def build_workflow(
             modes=policy.route_modes,
             strategy=policy.route_strategy,
             max_walking_leg_meters=policy.max_walking_leg_meters,
+            stay_resolution=state["stay_resolution"],
+            day_boundaries=state["day_boundaries"],
         )
         logger.info(
             "optimization.problem_built | thread_id=%s problem_id=%s "
@@ -689,6 +747,7 @@ def build_workflow(
                 state["trip"],
                 state["optimization_pois"],
                 replan_round=0,
+                day_boundaries=state["day_boundaries"],
             )
             elapsed_ms = round((perf_counter() - started) * 1000, 2)
             result = degraded_result(
@@ -749,6 +808,8 @@ def build_workflow(
             route_strategy=policy.route_strategy,
             route_modes=policy.route_modes,
             max_walking_leg_meters=policy.max_walking_leg_meters,
+            stay_resolution=state["stay_resolution"],
+            day_boundaries=state["day_boundaries"],
         )
         _log_candidates(state, candidates)
         _log_node_completed(
@@ -1044,6 +1105,7 @@ def build_workflow(
             ),
         )
         if use_specialists:
+            assert specialists is not None
             repair_result, _ = await specialists.invoke(
                 role=AgentRole.REPLANNER,
                 reason=HandoffReason.HARD_REPAIR,
@@ -1327,6 +1389,7 @@ def build_workflow(
                 ),
             )
             if use_specialists:
+                assert specialists is not None
                 result, _ = await specialists.invoke(
                     role=AgentRole.CRITIC,
                     reason=HandoffReason.SOFT_CRITIQUE,
@@ -1939,6 +2002,8 @@ def build_workflow(
     add_node("build_search_plan", build_search_plan)
     add_node("load_pois", load_pois)
     add_node("resolve_poi_facts", resolve_poi_facts)
+    add_node("resolve_stay_anchor", resolve_stay_anchor_node)
+    add_node("derive_day_boundaries", derive_day_boundaries_node)
     add_node("build_route_matrix", build_route_matrix)
     add_node("build_optimization_problem", build_optimization_problem)
     add_node("solve_candidate_variants", solve_candidate_variants)
@@ -1977,7 +2042,9 @@ def build_workflow(
     builder.add_edge("execution_budget_guard", "build_search_plan")
     builder.add_edge("build_search_plan", "load_pois")
     builder.add_edge("load_pois", "resolve_poi_facts")
-    builder.add_edge("resolve_poi_facts", "build_route_matrix")
+    builder.add_edge("resolve_poi_facts", "resolve_stay_anchor")
+    builder.add_edge("resolve_stay_anchor", "derive_day_boundaries")
+    builder.add_edge("derive_day_boundaries", "build_route_matrix")
     builder.add_edge("build_route_matrix", "build_optimization_problem")
     builder.add_edge("build_optimization_problem", "solve_candidate_variants")
     builder.add_edge(
@@ -2067,6 +2134,8 @@ def initial_state(request: PlanningRequest, thread_id: str) -> TravelState:
         "search_queries": [],
         "poi_facts": [],
         "planning_pois": [],
+        "stay_resolution": None,
+        "day_boundaries": (),
         "optimization_pois": [],
         "optimization_problem": None,
         "optimization_result": None,
@@ -2134,6 +2203,7 @@ def response_from_state(state: TravelState) -> PlanningResponse:
         ),
         grounded_explanation=state["grounded_explanation"],
         soft_iterations=state["soft_iterations"],
+        stay_resolution=state["stay_resolution"],
     )
 
 

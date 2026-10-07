@@ -65,6 +65,13 @@ class ProposalStatus(StrEnum):
     EXPIRED = "expired"
 
 
+class PreferenceLearningStatus(StrEnum):
+    NOT_RUN = "not_run"
+    SKIPPED = "skipped"
+    COMPLETED = "completed"
+    DEGRADED = "degraded"
+
+
 class AgentRole(StrEnum):
     PLANNER = "planner"
     CRITIC = "critic"

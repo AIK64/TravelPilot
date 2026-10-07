@@ -52,7 +52,8 @@ async def test_mock_repair_benchmark_is_reproducible(
         for case in report.cases
         if not case.exact
     ]
-    assert report.repair_success_rate == 1.0
+    # 完整计入日终返程后，两类约束确实不可通过删除活动安全修复。
+    assert report.repair_success_rate == 0.75
     assert report.hard_constraint_satisfaction_rate == 1.0
     assert report.bounded_termination_rate == 1.0
     assert report.replanning_locality == 1.0

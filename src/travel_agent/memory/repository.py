@@ -34,6 +34,9 @@ class PreferenceRepository(Protocol):
         self, tenant_id: str, user_id: str, content_hash: str
     ) -> PreferenceMemory | None: ...
     async def create_proposal(self, proposal: MemoryProposal) -> None: ...
+    async def find_pending_proposal(
+        self, tenant_id: str, user_id: str, content_hash: str
+    ) -> MemoryProposal | None: ...
     async def get_proposal(
         self, tenant_id: str, user_id: str, proposal_id: str
     ) -> MemoryProposal: ...
@@ -143,6 +146,20 @@ class InMemoryPreferenceRepository:
             if proposal.proposal_id in self._proposals:
                 raise MemoryConflictError("duplicate_proposal_id")
             self._proposals[proposal.proposal_id] = proposal.model_copy(deep=True)
+
+    async def find_pending_proposal(
+        self, tenant_id: str, user_id: str, content_hash: str
+    ) -> MemoryProposal | None:
+        async with self._lock:
+            for item in self._proposals.values():
+                if (
+                    item.tenant_id == tenant_id
+                    and item.user_id == user_id
+                    and item.content_hash == content_hash
+                    and item.pending_at()
+                ):
+                    return item.model_copy(deep=True)
+        return None
 
     async def get_proposal(
         self, tenant_id: str, user_id: str, proposal_id: str
@@ -364,6 +381,21 @@ class SQLitePreferenceRepository:
                 self._connection.commit()
             except sqlite3.IntegrityError:
                 raise MemoryConflictError("duplicate_proposal_id") from None
+
+    async def find_pending_proposal(
+        self, tenant_id: str, user_id: str, content_hash: str
+    ) -> MemoryProposal | None:
+        async with self._lock:
+            rows = self._connection.execute(
+                "SELECT payload FROM memory_proposals "
+                "WHERE tenant_id=? AND user_id=?",
+                (tenant_id, user_id),
+            ).fetchall()
+        for row in rows:
+            item = MemoryProposal.model_validate_json(row[0])
+            if item.content_hash == content_hash and item.pending_at():
+                return item
+        return None
 
     async def get_proposal(
         self, tenant_id: str, user_id: str, proposal_id: str

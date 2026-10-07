@@ -31,10 +31,15 @@ class MockPOIProvider:
         keyword = _normalize(query.keyword)
         matches = []
         for index, poi in enumerate(get_mock_pois(query.city)):
+            scenic_query = query.types == "110000" and keyword == "景点"
+            if scenic_query and not set(poi.categories).intersection(
+                {"自然", "人文", "历史", "街区", "公园", "博物馆", "寺庙"}
+            ):
+                continue
             searchable = [_normalize(poi.name)]
             searchable.extend(_normalize(value) for value in poi.categories)
             searchable.extend(_normalize(value) for value in poi.suitability_tags)
-            if keyword and not any(keyword in value for value in searchable):
+            if not scenic_query and keyword and not any(keyword in value for value in searchable):
                 continue
             matches.append((index, poi))
 

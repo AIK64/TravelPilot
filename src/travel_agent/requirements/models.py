@@ -16,7 +16,11 @@ from travel_agent.domain.models import (
     PlanningResponse,
     TripSpec,
 )
-from travel_agent.memory.models import PreferenceContext
+from travel_agent.memory.models import (
+    MemoryProposal,
+    PreferenceContext,
+    PreferenceLearningStatus,
+)
 
 
 class RequirementProviderMode(StrEnum):
@@ -284,7 +288,7 @@ class NaturalPlanningRequest(BaseModel):
 
 class NaturalPlanningResponse(BaseModel):
     thread_id: str
-    status: Literal["completed", "infeasible", "needs_clarification"]
+    status: Literal["completed", "infeasible", "needs_clarification", "failed"]
     trip: TripSpec | None = None
     issues: list[RequirementIssue] = Field(default_factory=list)
     clarification_questions: list[str] = Field(default_factory=list)
@@ -294,4 +298,11 @@ class NaturalPlanningResponse(BaseModel):
     planning: PlanningResponse | None = None
     preference_context: PreferenceContext | None = None
     personalized_fields: list[str] = Field(default_factory=list)
+    preference_learning_status: PreferenceLearningStatus = (
+        PreferenceLearningStatus.NOT_RUN
+    )
+    memory_proposals: list[MemoryProposal] = Field(default_factory=list)
+    preference_extracted_count: int = Field(default=0, ge=0)
+    preference_rejected_count: int = Field(default=0, ge=0)
+    preference_deduplicated_count: int = Field(default=0, ge=0)
     message: str | None = None

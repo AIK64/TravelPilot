@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated
 import inspect
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from fastapi import APIRouter, Depends, Query, Response
 
@@ -13,6 +13,7 @@ from travel_agent.api.dependencies import (
     get_runtime,
 )
 from travel_agent.application.service import TravelApplicationService
+from travel_agent.application.errors import ApplicationConflictError
 from travel_agent.identity.models import Principal
 from travel_agent.domain.models import PlanningRequest, PlanningResponse
 from travel_agent.domain.lifecycle_models import (
@@ -22,7 +23,7 @@ from travel_agent.domain.lifecycle_models import (
     PlanVersion,
 )
 from travel_agent.runtime import PlanningRuntime
-from travel_agent.execution.models import AgentRunRecord, TracePage
+from travel_agent.execution.models import AgentRunRecord, RunKind, RunStatus, TracePage
 from travel_agent.domain.weather_models import (
     WeatherEventView,
     WeatherRefreshRequest,
@@ -167,6 +168,36 @@ async def resume_plan_session(
 ) -> PlanSessionResponse:
     result = await service.execute_resume_plan_session(
         session_id, request, principal=principal
+    )
+    _apply_run_headers(response, result)
+    return result.payload
+
+
+@router.post(
+    "/api/v1/runs/{run_id}/plan-session",
+    response_model=PlanSessionResponse,
+    tags=["plan-lifecycle"],
+)
+async def create_selection_session_from_run(
+    run_id: str,
+    response: Response,
+    principal: Annotated[Principal, Depends(get_principal)],
+    service: Annotated[TravelApplicationService, Depends(get_application_service)],
+) -> PlanSessionResponse:
+    """复用当前用户已完成的规划候选；重复请求返回同一选择会话。"""
+    record = await service.get_run(run_id, principal=principal)
+    if (
+        record.run_kind not in {RunKind.NATURAL_PLAN, RunKind.CLARIFICATION_RESUME}
+        or record.status is not RunStatus.COMPLETED
+        or record.thread_id is None
+    ):
+        raise ApplicationConflictError("该运行没有可供确认的已完成自然语言规划")
+    session_id = str(uuid5(NAMESPACE_URL, f"travel-agent:selection:{record.thread_id}"))
+    result = await service.runtime.execute_create_plan_session_from_checkpoint(
+        thread_id=record.thread_id,
+        session_id=session_id,
+        source_run_id=run_id,
+        principal=principal,
     )
     _apply_run_headers(response, result)
     return result.payload

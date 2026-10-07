@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import math
 import re
 from datetime import date, datetime, time, timezone
@@ -20,6 +22,9 @@ from travel_agent.domain.tool_models import (
     ValueSource,
 )
 from travel_agent.tools.errors import ToolProviderError
+
+
+logger = logging.getLogger(__name__)
 
 
 RETRYABLE_AMAP_CODES = {
@@ -51,7 +56,9 @@ _WEEKLY_HOURS = re.compile(
 
 
 class AMapClient:
-    """共享的安全高德 JSON client；不承担缓存、限流或重试。"""
+    """共享的安全高德 JSON client；按接口限速，缓存与重试由 Gateway 管理。"""
+
+    REQUEST_INTERVAL_SECONDS = 0.4
 
     def __init__(
         self,
@@ -63,6 +70,30 @@ class AMapClient:
         self._client = client
         self.__api_key = api_key
         self.timeout_seconds = timeout_seconds
+        # Runtime 内所有规划任务共享此 client；不同接口使用独立的请求节奏。
+        self._request_locks: dict[str, asyncio.Lock] = {}
+        self._last_request_at: dict[str, float] = {}
+
+    async def _wait_for_request_slot(self, operation: str, path: str) -> None:
+        lock = self._request_locks.setdefault(path, asyncio.Lock())
+        async with lock:
+            loop = asyncio.get_running_loop()
+            last_request_at = self._last_request_at.get(path)
+            if last_request_at is not None:
+                delay = self.REQUEST_INTERVAL_SECONDS - (loop.time() - last_request_at)
+                if delay > 0:
+                    logger.info(
+                        "amap.request.throttled operation=%s wait_seconds=%.3f",
+                        operation,
+                        delay,
+                    )
+                    # 等待被取消时不预占后续槽位，也不会发出 HTTP 请求。
+                    while delay > 0:
+                        await asyncio.sleep(delay)
+                        delay = self.REQUEST_INTERVAL_SECONDS - (
+                            loop.time() - last_request_at
+                        )
+            self._last_request_at[path] = loop.time()
 
     async def request_json(
         self,
@@ -70,6 +101,8 @@ class AMapClient:
         path: str,
         params: dict[str, object],
     ) -> dict[str, object]:
+        # 每次真实请求（包括 Gateway 重试）都经过同一接口的限速器。
+        await self._wait_for_request_slot(operation, path)
         error: ToolProviderError | None = None
         response: httpx.Response | None = None
         try:
@@ -235,10 +268,11 @@ class AMapPOIProvider:
             "/v5/place/text",
             {
                 "keywords": query.keyword,
-                "city": query.city,
+                "region": query.city,
                 "city_limit": "true",
                 "show_fields": "business",
                 "page_size": query.limit,
+                **({"types": query.types} if query.types else {}),
             },
         )
         raw_pois = payload.get("pois")
@@ -314,6 +348,7 @@ class AMapRouteProvider:
             "origin": _format_coordinate(query.origin),
             "destination": _format_coordinate(query.destination),
             "strategy": query.strategy,
+            "show_fields": "cost",
         }
         if query.origin_poi_id is not None:
             params["origin_id"] = query.origin_poi_id

@@ -28,6 +28,55 @@ from travel_agent.domain.tool_models import POIFacts, ValueSource
 from travel_agent.planning.validator import validate_candidate
 
 
+@pytest.mark.parametrize(
+    ("first_id", "second_id", "second_name", "day_offset"),
+    [
+        ("lingyin", "lingyin", "灵隐寺另一名称", 1),
+        ("lingyin", "alias", " 灵 隐 寺 ", 1),
+        (None, None, "灵隐寺", 1),
+        ("lingyin", "lingyin", "灵隐寺", 0),
+        ("lingyin", "building", "灵隐寺-大雄宝殿", 1),
+    ],
+)
+def test_repeated_attraction_fails_hard_validation(
+    hangzhou_trip, first_id, second_id, second_name, day_offset, caplog
+):
+    candidate = _candidate_with_activity(hangzhou_trip, Decimal("0"))
+    first = candidate.days[0].items[0].model_copy(update={"poi_id": first_id})
+    candidate.days[0].items = [first]
+    repeated = first.model_copy(update={
+        "poi_id": second_id,
+        "name": second_name,
+        "start_at": first.start_at + timedelta(days=day_offset, hours=2),
+        "end_at": first.end_at + timedelta(days=day_offset, hours=2),
+    })
+    if day_offset:
+        candidate.days.append(candidate.days[0].model_copy(update={
+            "date": candidate.days[0].date + timedelta(days=day_offset),
+            "items": [repeated],
+        }))
+    else:
+        candidate.days[0].items.append(repeated)
+    result = validate_candidate(hangzhou_trip, candidate, [])
+    duplicates = [violation for violation in result.violations if violation.type == "duplicate_poi"]
+    assert not result.valid
+    assert len(duplicates) == 1
+    assert duplicates[0].severity is ViolationSeverity.ERROR
+    assert duplicates[0].day == candidate.days[-1].date
+    assert "validation.duplicate_poi" in caplog.text
+
+
+def test_repeated_non_activity_is_not_a_duplicate_attraction(hangzhou_trip):
+    candidate = _candidate_with_activity(hangzhou_trip, Decimal("0"))
+    # 重复住宿/休息记录不属于景点访问。
+    resting = candidate.days[0].items[0].model_copy(update={"type": ItemType.REST})
+    candidate.days[0].items.append(resting)
+    assert not any(
+        violation.type == "duplicate_poi"
+        for violation in validate_candidate(hangzhou_trip, candidate, []).violations
+    )
+
+
 def test_domain_models_resolve_provenance_types_without_defaults_import():
     """防止 domain 模型依赖规划模块的偶然导入顺序才能生成 schema。"""
     source_root = Path(__file__).parents[1] / "src"
@@ -367,6 +416,7 @@ def test_opening_hours_use_daily_provenance_for_hard_validation(hangzhou_trip):
     result = validate_candidate(hangzhou_trip, candidate, pois=[provider_poi])
 
     assert [(item.type, item.day) for item in result.violations if item.severity is ViolationSeverity.ERROR] == [
+        ("duplicate_poi", second_day),
         ("outside_opening_hours", first_day)
     ]
     assert [(item.type, item.severity) for item in result.violations if item.severity is ViolationSeverity.WARNING] == [

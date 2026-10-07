@@ -43,6 +43,10 @@ class RunTerminalReason(StrEnum):
     REPOSITORY_FAILURE = "repository_failure"
     INVALID_INTERNAL_STATE = "invalid_internal_state"
     USER_CANCELLED = "user_cancelled"
+    INVALID_AGENT_DECISION = "invalid_agent_decision"
+    AGENT_NO_PROGRESS = "agent_no_progress"
+    EVIDENCE_UNAVAILABLE = "evidence_unavailable"
+    ACTION_POLICY_REJECTED = "action_policy_rejected"
 
 
 class TraceStatus(StrEnum):
@@ -89,9 +93,16 @@ class TraceEventType(StrEnum):
     BUDGET_UPDATED = "budget.updated"
     BUDGET_EXCEEDED = "budget.exceeded"
     DEGRADATION_APPLIED = "degradation.applied"
+    STAY_ANCHOR_RESOLVED = "stay_anchor.resolved"
+    DAY_BOUNDARIES_RESOLVED = "day_boundaries.resolved"
     MEMORY_NAMESPACE_RESOLVED = "memory.namespace_resolved"
     MEMORY_RETRIEVE_STARTED = "memory.retrieve_started"
     MEMORY_RETRIEVE_COMPLETED = "memory.retrieve_completed"
+    MEMORY_EXTRACTION_STARTED = "memory.extraction_started"
+    MEMORY_EXTRACTION_COMPLETED = "memory.extraction_completed"
+    MEMORY_CANDIDATE_REJECTED = "memory.candidate_rejected"
+    MEMORY_CANDIDATE_DEDUPLICATED = "memory.candidate_deduplicated"
+    MEMORY_EXTRACTION_DEGRADED = "memory.extraction_degraded"
     MEMORY_CONFLICT_DETECTED = "memory.conflict_detected"
     CONTEXT_COMPOSED = "context.composed"
     MEMORY_PROPOSAL_CREATED = "memory.proposal_created"
@@ -105,6 +116,20 @@ class TraceEventType(StrEnum):
     PROVIDER_ATTEMPT_COMPLETED = "provider.attempt_completed"
     PROVIDER_FALLBACK_SELECTED = "provider.fallback_selected"
     PROVIDER_CHAIN_EXHAUSTED = "provider.chain_exhausted"
+    AGENT_DECISION_STARTED = "agent.decision_started"
+    AGENT_DECISION_COMPLETED = "agent.decision_completed"
+    AGENT_DECISION_FAILED = "agent.decision_failed"
+    AGENT_ACTION_VALIDATED = "agent.action_validated"
+    AGENT_ACTION_REJECTED = "agent.action_rejected"
+    AGENT_ACTION_DISPATCHED = "agent.action_dispatched"
+    AGENT_OBSERVATION_RECORDED = "agent.observation_recorded"
+    EVIDENCE_GAP_DERIVED = "evidence.gap_derived"
+    EVIDENCE_RECORDED = "evidence.recorded"
+    EVIDENCE_EXPIRED = "evidence.expired"
+    REPLANNER_PROPOSAL_CREATED = "replanner.proposal_created"
+    REPLANNER_PROPOSAL_REJECTED = "replanner.proposal_rejected"
+    FINAL_GUARD_COMPLETED = "final_guard.completed"
+    AGENT_NO_PROGRESS = "agent.no_progress"
 
 
 class ExecutionBudget(BaseModel):
@@ -128,6 +153,12 @@ class ExecutionBudget(BaseModel):
     max_estimated_cost_microunits: int | None = Field(default=None, ge=1)
     terminal_step_reserve: int = Field(default=2, ge=1, le=100)
     terminal_trace_reserve: int = Field(default=4, ge=2, le=100)
+    max_agent_decisions: int = Field(default=12, ge=1, le=1_000)
+    max_invalid_actions: int = Field(default=2, ge=0, le=100)
+    max_evidence_records: int = Field(default=256, ge=1, le=100_000)
+    max_observation_history: int = Field(default=8, ge=1, le=1_000)
+    max_planner_context_tokens: int = Field(default=6_000, ge=128, le=1_000_000)
+    max_replanner_context_tokens: int = Field(default=5_000, ge=128, le=1_000_000)
 
     @model_validator(mode="after")
     def validate_reserves(self) -> "ExecutionBudget":
@@ -159,6 +190,10 @@ class ExecutionUsage(BaseModel):
     checkpoint_writes: int = Field(default=0, ge=0)
     trace_events: int = Field(default=0, ge=0)
     estimated_cost_microunits: int | None = Field(default=None, ge=0)
+    agent_decisions: int = Field(default=0, ge=0)
+    invalid_actions: int = Field(default=0, ge=0)
+    evidence_records: int = Field(default=0, ge=0)
+    observations: int = Field(default=0, ge=0)
 
 
 JsonScalar = str | int | float | bool | None

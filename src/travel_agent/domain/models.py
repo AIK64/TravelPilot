@@ -79,6 +79,32 @@ class LocationAnchor(BaseModel):
     coordinate: Coordinate
 
 
+class StayAnchorMode(StrEnum):
+    PROVIDED = "provided"
+    RECOMMENDED = "recommended"
+    NOT_REQUIRED = "not_required"
+    UNRESOLVED = "unresolved"
+
+
+class StayAnchorResolution(BaseModel):
+    """规划采用的住宿基点；与用户输入 accommodation 严格分离。"""
+
+    mode: StayAnchorMode
+    anchor: LocationAnchor | None = None
+    confidence: float = Field(ge=0, le=1)
+    confirmed: bool = False
+    reference_poi_ids: tuple[str, ...] = ()
+    reason_codes: tuple[str, ...] = ()
+
+
+class DayBoundary(BaseModel):
+    date: date
+    start_role: str
+    start_anchor: LocationAnchor
+    end_role: str
+    end_anchor: LocationAnchor
+
+
 class MobilityConstraints(BaseModel):
     max_daily_walking_meters: int = Field(default=8_000, ge=0)
     max_daily_activity_minutes: int = Field(default=480, gt=0)
@@ -182,6 +208,7 @@ class PlanItem(BaseModel):
     start_at: datetime
     end_at: datetime
     poi_id: str | None = None
+    coordinate: Coordinate | None = None
     travel_from_previous_minutes: int = Field(default=0, ge=0)
     distance_from_previous_meters: int = Field(default=0, ge=0)
     estimated_cost: Decimal | None = Field(default=None, ge=0)
@@ -197,6 +224,18 @@ class PlanItem(BaseModel):
         return self
 
 
+class PlanRouteLeg(BaseModel):
+    origin_name: str
+    destination_name: str
+    duration_minutes: int = Field(ge=0)
+    distance_meters: int = Field(ge=0)
+    mode: str
+    provider: str
+    data_confidence: float = Field(ge=0, le=1)
+    walking_distance_meters: int = Field(default=0, ge=0)
+    walking_distance_estimated: bool = False
+
+
 class DayPlan(BaseModel):
     date: date
     theme: str
@@ -210,6 +249,9 @@ class DayPlan(BaseModel):
     total_travel_minutes: int = 0
     walking_distance_meters: int = 0
     fatigue_score: float = Field(default=0, ge=0, le=1)
+    start_anchor: LocationAnchor | None = None
+    end_anchor: LocationAnchor | None = None
+    end_leg: PlanRouteLeg | None = None
 
     @computed_field
     @property
@@ -300,6 +342,7 @@ class PlanningRequest(BaseModel):
 
 class PlanningResponse(BaseModel):
     status: str
+    terminal_reason: str | None = None
     selected_plan: PlanCandidate | None
     candidates: list[PlanCandidate]
     iterations: int
@@ -311,6 +354,12 @@ class PlanningResponse(BaseModel):
     candidate_critiques: list["SoftCritique"] = Field(default_factory=list)
     grounded_explanation: "GroundedExplanation | None" = None
     soft_iterations: int = Field(default=0, ge=0, le=1)
+    stay_resolution: StayAnchorResolution | None = None
+    agent_mode: str = "fixed_workflow"
+    decision_count: int = Field(default=0, ge=0)
+    action_summary: tuple[str, ...] = ()
+    evidence_summary: dict[str, int] = Field(default_factory=dict)
+    degraded_reasons: tuple[str, ...] = ()
 
 
 def rebuild_provenance_models(

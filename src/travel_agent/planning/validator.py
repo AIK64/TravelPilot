@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+import logging
 from decimal import Decimal
 
 from travel_agent.domain.models import (
@@ -15,6 +16,10 @@ from travel_agent.domain.models import (
     ViolationSeverity,
 )
 from travel_agent.domain.tool_models import ValueSource
+from travel_agent.planning.poi_identity import normalize_poi_name, poi_names_overlap
+
+
+logger = logging.getLogger(__name__)
 
 
 _ASSUMPTION_WARNINGS = {
@@ -36,7 +41,7 @@ _ASSUMPTION_WARNINGS = {
     ),
     "party_cost": (
         "cost_unverified",
-        "部分地点费用未知，尚未由 Provider 验证",
+        "部分地点费用按默认值估算，尚未由 Provider 验证",
     ),
 }
 
@@ -53,6 +58,16 @@ def _assumption_warnings(
     """把默认事实收敛为候选计划级告警，避免每条日程重复报告。"""
     warnings_by_type: dict[str, Violation] = {}
     for assumption in candidate.assumptions:
+        if assumption.field == "stay_anchor":
+            warnings_by_type.setdefault(
+                "stay_anchor_unconfirmed",
+                Violation(
+                    type="stay_anchor_unconfirmed",
+                    severity=ViolationSeverity.WARNING,
+                    message="住宿位置未确认，当前路线基于建议住宿区域估算",
+                ),
+            )
+            continue
         if assumption.source is not ValueSource.DEFAULT:
             continue
         violation_type, message = _ASSUMPTION_WARNINGS.get(
@@ -106,6 +121,48 @@ def validate_candidate(
     all_items = [item for day in candidate.days for item in day.items]
     activities = [item for item in all_items if item.type == ItemType.ACTIVITY]
 
+    visited_ids: dict[str, date] = {}
+    visited_names: dict[str, date] = {}
+    for day in sorted(candidate.days, key=lambda value: value.date):
+        for item in sorted(day.items, key=lambda value: value.start_at):
+            if item.type is not ItemType.ACTIVITY:
+                continue
+            poi = poi_by_id.get(item.poi_id) if item.poi_id else None
+            canonical_name = (
+                poi.facts.name if isinstance(poi, PlanningPOI)
+                else poi.name if isinstance(poi, POI)
+                else item.name
+            )
+            name = normalize_poi_name(canonical_name)
+            previous_day = visited_ids.get(item.poi_id) if item.poi_id else None
+            if previous_day is None and name:
+                previous_day = visited_names.get(name)
+                if previous_day is None:
+                    previous_day = next(
+                        (seen_day for seen_name, seen_day in visited_names.items()
+                         if poi_names_overlap(name, seen_name)),
+                        None,
+                    )
+            if previous_day is not None:
+                violations.append(
+                    Violation(
+                        type="duplicate_poi",
+                        severity=ViolationSeverity.ERROR,
+                        day=day.date,
+                        entity_ids=[item.poi_id] if item.poi_id else [],
+                        message=f"景点重复安排：{item.name}，已在 {previous_day} 安排",
+                        repair_hint="保留一次访问，删除重复项或替换为尚未安排的景点，并重新计算路线",
+                    )
+                )
+                logger.warning(
+                    "validation.duplicate_poi candidate_id=%s poi_id=%s day=%s first_day=%s",
+                    candidate.id, item.poi_id, day.date, previous_day,
+                )
+            if item.poi_id:
+                visited_ids.setdefault(item.poi_id, day.date)
+            if name:
+                visited_names.setdefault(name, day.date)
+
     if not activities:
         violations.append(
             Violation(
@@ -135,6 +192,16 @@ def validate_candidate(
 
     for day in candidate.days:
         ordered = sorted(day.items, key=lambda item: item.start_at)
+        if ordered and day.end_anchor is not None and day.end_leg is None:
+            violations.append(
+                Violation(
+                    type="missing_day_end_route",
+                    severity=ViolationSeverity.ERROR,
+                    day=day.date,
+                    message="当天最后一个活动缺少前往日终锚点的路线",
+                    repair_hint="补充最后一个 POI 到住宿点或离开地点的路线",
+                )
+            )
         previous = None
         for item in ordered:
             if previous and item.start_at < previous.end_at:
@@ -232,6 +299,29 @@ def validate_candidate(
                     repair_hint="减少跨区域活动或降低每日活动数量",
                 )
             )
+
+        if ordered and day.end_leg is not None:
+            day_deadline = datetime.combine(
+                day.date, trip.daily_end, tzinfo=trip_timezone
+            )
+            if day.date == trip.departure.at.date():
+                day_deadline = min(day_deadline, departure_buffer)
+            end_arrival = ordered[-1].end_at + timedelta(
+                minutes=day.end_leg.duration_minutes
+            )
+            if end_arrival > day_deadline:
+                violations.append(
+                    Violation(
+                        type="day_end_route_late",
+                        severity=ViolationSeverity.ERROR,
+                        day=day.date,
+                        entity_ids=(
+                            [ordered[-1].poi_id] if ordered[-1].poi_id else []
+                        ),
+                        message="当天最后一个活动结束后无法按时到达日终锚点",
+                        repair_hint="提前结束当天行程或移除最后一个活动",
+                    )
+                )
 
         activity_minutes = sum(
             int((item.end_at - item.start_at).total_seconds() / 60)

@@ -3,9 +3,11 @@ from __future__ import annotations
 from typing import NotRequired, TypedDict
 
 from travel_agent.domain.models import (
+    DayBoundary,
     PlanCandidate,
     PlanningPOI,
     POIResolutionIssue,
+    StayAnchorResolution,
     TripSpec,
 )
 from travel_agent.domain.tool_models import (
@@ -39,6 +41,8 @@ class TravelState(TypedDict):
     search_queries: list[POISearchQuery]
     poi_facts: list[POIFacts]
     planning_pois: list[PlanningPOI]
+    stay_resolution: StayAnchorResolution | None
+    day_boundaries: tuple[DayBoundary, ...]
     optimization_pois: list[PlanningPOI]
     optimization_problem: OptimizationProblem | None
     optimization_result: OptimizationResult | None

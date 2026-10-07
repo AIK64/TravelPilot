@@ -122,7 +122,7 @@ async def test_specialist_rejects_large_output_and_propagates_failure(hangzhou_t
 
 
 @pytest.mark.asyncio
-async def test_specialist_mode_records_bounded_handoff_trace(hangzhou_trip):
+async def test_legacy_specialist_mode_migrates_to_dynamic_planner(hangzhou_trip):
     runtime = await PlanningRuntime.create(
         Settings(agent_mode=AgentMode.SPECIALIST_SUBAGENTS, agent_max_handoffs=8)
     )
@@ -138,21 +138,17 @@ async def test_specialist_mode_records_bounded_handoff_trace(hangzhou_trip):
     finally:
         await runtime.close()
 
-    started = [
+    handoffs = [
         event
         for event in trace
         if event.event_type is TraceEventType.AGENT_HANDOFF_STARTED
     ]
-    completed = [
+    decisions = [
         event
         for event in trace
-        if event.event_type is TraceEventType.AGENT_HANDOFF_COMPLETED
+        if event.event_type is TraceEventType.AGENT_DECISION_COMPLETED
     ]
-    assert started
-    assert len(started) == len(completed)
-    assert {event.attributes["agent_role"] for event in started} <= {
-        "planner",
-        "critic",
-        "replanner",
-    }
-    assert all("input_hash" not in event.attributes for event in started)
+    assert runtime.agent_mode is AgentMode.DYNAMIC_PLANNER
+    assert result.payload.agent_mode == "dynamic_planner"
+    assert handoffs == []
+    assert decisions

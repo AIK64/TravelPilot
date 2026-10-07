@@ -11,10 +11,15 @@ x-app-env: &app-env
   DATABASE_URL: postgresql://travel_agent:${POSTGRES_PASSWORD:-travel_agent_dev}@postgres:5432/travel_agent
   ASYNC_EXECUTION_BACKEND: redis
   REDIS_URL: redis://redis:6379/0
-  AGENT_MODE: specialist_subagents
+  AGENT_MODE: dynamic_planner
+  PLANNER_PROVIDER: ${PLANNER_PROVIDER:-mock}
+  PLANNER_MODEL: ${PLANNER_MODEL:-mock-dynamic-planner-v1}
+  REPLANNER_PROVIDER: ${REPLANNER_PROVIDER:-deterministic}
+  REPLANNER_MODEL: ${REPLANNER_MODEL:-deterministic-replanner-v1}
   REQUIREMENT_PROVIDER: ${REQUIREMENT_PROVIDER:-mock}
   CRITIC_PROVIDER: ${CRITIC_PROVIDER:-mock}
   EDIT_PROVIDER: ${EDIT_PROVIDER:-mock}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
   DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
   DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
   DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-v4-flash}

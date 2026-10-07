@@ -37,6 +37,10 @@ class ExecutionLedger:
             "interrupts": 0,
             "checkpoint_writes": 0,
             "trace_events": 0,
+            "agent_decisions": 0,
+            "invalid_actions": 0,
+            "evidence_records": 0,
+            "observations": 0,
         }
         self._token_usage_complete = True
         self._last_action_fingerprint: str | None = None
@@ -146,6 +150,38 @@ class ExecutionLedger:
 
     def note_trace_event(self) -> None:
         self._increment("trace_events")
+
+    def consume_agent_decision(self) -> None:
+        self._consume(
+            "agent_decisions",
+            1,
+            self.budget.max_agent_decisions,
+            "max_agent_decisions",
+        )
+
+    def consume_invalid_action(self) -> None:
+        self._consume(
+            "invalid_actions",
+            1,
+            self.budget.max_invalid_actions,
+            "max_invalid_actions",
+        )
+
+    def consume_evidence_record(self) -> None:
+        self._consume(
+            "evidence_records",
+            1,
+            self.budget.max_evidence_records,
+            "max_evidence_records",
+        )
+
+    def consume_observation(self) -> None:
+        self._consume(
+            "observations",
+            1,
+            self.budget.max_observation_history,
+            "max_observation_history",
+        )
 
     def note_action_fingerprint(self, fingerprint: str) -> None:
         """在执行重复动作前阻断无进展循环；不同动作会重置连续计数。"""

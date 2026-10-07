@@ -41,7 +41,11 @@ async def run_ablation_evaluation(
     root = manifest_path.resolve().parents[2]
     dataset_path = root / manifest.base_dataset
     sources = load_jsonl(dataset_path)
-    active_settings = settings or Settings.from_env({})
+    # v1.0 消融指标以固定工作流为实验对象。生产默认已迁移到动态 Planner，
+    # 因此这里必须显式锁定历史基线，避免“默认模式变化”污染纵向对比。
+    active_settings = settings or Settings.from_env(
+        {"AGENT_MODE": "fixed_workflow"}
+    )
     started = datetime.now(timezone.utc)
     results: list[ReleaseCaseResult] = []
 

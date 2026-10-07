@@ -32,10 +32,10 @@ def test_assume_policy_marks_missing_hours_duration_and_cost(hangzhou_trip, poi_
 
     assert resolution.poi is not None
     assert resolution.poi.opening_windows[hangzhou_trip.start_date] == TimeWindow(
-        start=time(10), end=time(16)
+        start=time(8), end=time(18)
     )
-    assert resolution.poi.duration_minutes == 90
-    assert resolution.poi.party_cost is None
+    assert resolution.poi.duration_minutes == 120
+    assert resolution.poi.party_cost == Decimal("45") * hangzhou_trip.travelers
     assert {item.field for item in resolution.poi.assumptions} == {
         "opening_window",
         "duration_minutes",
@@ -54,6 +54,8 @@ def test_assume_policy_marks_missing_hours_duration_and_cost(hangzhou_trip, poi_
     assumptions_by_field = {item.field: item for item in resolution.poi.assumptions}
     assert {item.source for item in assumptions_by_field.values()} == {ValueSource.DEFAULT}
     assert assumptions_by_field["opening_window"].source is ValueSource.DEFAULT
+    assert assumptions_by_field["opening_window"].value == "08:00-18:00"
+    assert assumptions_by_field["duration_minutes"].value == "120"
     assert assumptions_by_field["opening_window"].affected_dates == [
         date(2026, 10, 2),
         date(2026, 10, 3),
@@ -61,6 +63,7 @@ def test_assume_policy_marks_missing_hours_duration_and_cost(hangzhou_trip, poi_
     ]
     assert assumptions_by_field["duration_minutes"].affected_dates == []
     assert assumptions_by_field["party_cost"].affected_dates == []
+    assert assumptions_by_field["party_cost"].value == "45"
     assert resolution.poi.data_confidence == pytest.approx(0.45)
 
 
@@ -74,6 +77,15 @@ def test_strict_policy_rejects_missing_critical_facts(hangzhou_trip, poi_facts):
         "duration_minutes",
         "party_cost",
     ]
+
+
+def test_free_provider_price_is_not_replaced_by_default(hangzhou_trip, poi_facts):
+    facts = poi_facts.model_copy(update={"average_cost_per_person": Decimal("0")})
+    resolution = POIDefaultPolicy(UnknownFactPolicy.ASSUME_WITH_WARNING).resolve(
+        facts, hangzhou_trip
+    )
+    assert resolution.poi.party_cost == Decimal("0")
+    assert "party_cost" not in {item.field for item in resolution.poi.assumptions}
 
 
 def test_policy_resolves_hours_by_trip_date_and_only_uses_matching_today_value(hangzhou_trip, poi_facts):

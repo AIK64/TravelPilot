@@ -107,6 +107,7 @@ async def test_amap_route_provider_normalizes_distance_and_seconds(load_fixture)
     assert result.fetched_at.tzinfo is not None
     assert seen[0].url.path == "/v5/direction/driving"
     assert seen[0].url.params["strategy"] == "32"
+    assert seen[0].url.params["show_fields"] == "cost"
 
 
 @pytest.mark.asyncio
@@ -209,7 +210,18 @@ async def test_amap_poi_provider_normalizes_success(load_fixture):
     assert set(facts[0].opening_windows_by_weekday) == {1, 2, 3, 4, 5, 6}
     assert seen[0].url.path == "/v5/place/text"
     assert seen[0].url.params["city_limit"] == "true"
+    assert seen[0].url.params["region"] == QUERY.city
     assert seen[0].url.params["show_fields"] == "business"
+
+
+@pytest.mark.asyncio
+async def test_amap_scenic_query_limits_region_and_category(load_fixture):
+    provider, seen = amap_poi_provider(load_fixture("poi_success.json"))
+    await provider.search_pois(POISearchQuery(city="杭州", keyword="景点", types="110000"))
+    assert seen[0].url.params["region"] == "杭州"
+    assert seen[0].url.params["keywords"] == "景点"
+    assert seen[0].url.params["types"] == "110000"
+    assert seen[0].url.params["city_limit"] == "true"
 
 
 @pytest.mark.asyncio

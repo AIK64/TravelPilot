@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from time import perf_counter
 from typing import Literal, cast
 from uuid import uuid4
@@ -25,6 +26,12 @@ from travel_agent.execution.instrumentation import (
     instrument_node,
     instrument_route,
 )
+from travel_agent.execution.context import (
+    current_run_id,
+    record_degradation,
+    record_memory_event,
+)
+from travel_agent.execution.models import TraceEventType
 from travel_agent.requirements.anchors import (
     AnchorRole,
     build_anchor_search_plan,
@@ -55,7 +62,18 @@ from travel_agent.requirements.validation import (
     validate_requirement as check_requirement,
 )
 from travel_agent.identity.models import Principal
-from travel_agent.memory.models import AgentRole, PreferenceContext
+from travel_agent.memory.extraction import (
+    extract_preference_candidates as extract_memory_candidates,
+    prepare_preference_evidence as build_preference_evidence,
+    validate_preference_candidates as check_preference_candidates,
+)
+from travel_agent.memory.models import (
+    AgentRole,
+    MemoryProposalRequest,
+    PreferenceContext,
+    PreferenceLearningStatus,
+)
+from travel_agent.memory.policy import preference_content_hash
 from travel_agent.memory.service import PreferenceMemoryService
 from travel_agent.tools.errors import ToolUnavailableError
 from travel_agent.tools.gateway import ToolGateway
@@ -84,8 +102,16 @@ _REQUIREMENT_CHECKPOINT_ALLOWED_TYPES = (
     ("travel_agent.memory.models", "MemoryCategory"),
     ("travel_agent.memory.models", "MemoryConflict"),
     ("travel_agent.memory.models", "MemorySource"),
+    ("travel_agent.memory.models", "MemoryProposal"),
+    ("travel_agent.memory.models", "PreferenceLearningStatus"),
+    ("travel_agent.memory.models", "PreferenceScope"),
+    ("travel_agent.memory.models", "ProposalStatus"),
     ("travel_agent.memory.models", "PreferenceContext"),
     ("travel_agent.memory.models", "PreferenceSummary"),
+    ("travel_agent.memory.extraction", "ExtractedPreferenceCandidate"),
+    ("travel_agent.memory.extraction", "PersistenceIntent"),
+    ("travel_agent.memory.extraction", "PreferenceEvidence"),
+    ("travel_agent.memory.extraction", "RejectedPreferenceCandidate"),
 )
 
 
@@ -120,6 +146,7 @@ def build_requirement_workflow(
     requirement_gateway: RequirementGateway,
     tool_gateway: ToolGateway,
     planning_workflow: CompiledStateGraph,
+    planning_runner: Callable[[PlanningRequest, str], Awaitable[object]] | None = None,
     memory_service: PreferenceMemoryService | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> CompiledStateGraph:
@@ -530,13 +557,18 @@ def build_requirement_workflow(
         _log_node(state, "started", "execute_planning", state["status"])
         trip = state["trip"]
         assert trip is not None
-        response = await run_planning(
-            planning_workflow,
-            PlanningRequest(
-                trip=trip,
-                max_replan_rounds=state["natural_request"].max_replan_rounds,
-            ),
-            thread_id=state["thread_id"],
+        planning_request = PlanningRequest(
+            trip=trip,
+            max_replan_rounds=state["natural_request"].max_replan_rounds,
+        )
+        response = (
+            await planning_runner(planning_request, state["thread_id"])
+            if planning_runner is not None
+            else await run_planning(
+                planning_workflow,
+                planning_request,
+                thread_id=state["thread_id"],
+            )
         )
         _log_node(state, "completed", "execute_planning", response.status)
         return {
@@ -544,6 +576,225 @@ def build_requirement_workflow(
             "status": response.status,
             "message": response.message,
         }
+
+    def prepare_memory_evidence(state: RequirementState) -> dict:
+        _log_node(state, "started", "prepare_memory_evidence", state["status"])
+        record_memory_event(
+            TraceEventType.MEMORY_EXTRACTION_STARTED,
+            status="started",
+            operation="memory.extract_preferences",
+            attributes={"policy_version": "preference-extraction-v1"},
+        )
+        draft = state["requirement_draft"]
+        assert draft is not None
+        clarification = state["clarification_input"]
+        try:
+            evidence = build_preference_evidence(
+                state["natural_request"],
+                draft,
+                clarification_answer=clarification.answer if clarification else None,
+            )
+        except Exception:
+            logger.exception(
+                "memory.evidence_preparation_failed | thread_id=%s",
+                state["thread_id"],
+            )
+            record_degradation("preference_evidence_failure")
+            record_memory_event(
+                TraceEventType.MEMORY_EXTRACTION_DEGRADED,
+                status="degraded",
+                operation="memory.prepare_evidence",
+                attributes={"reason_code": "evidence_preparation_failure"},
+            )
+            return {
+                "preference_evidence": [],
+                "preference_learning_status": PreferenceLearningStatus.DEGRADED,
+            }
+        logger.info(
+            "memory.extraction_evidence_prepared | thread_id=%s evidence_count=%s",
+            state["thread_id"],
+            len(evidence),
+        )
+        _log_node(state, "completed", "prepare_memory_evidence", state["status"])
+        return {
+            "preference_evidence": evidence,
+            "preference_learning_status": (
+                PreferenceLearningStatus.COMPLETED
+                if evidence
+                else PreferenceLearningStatus.SKIPPED
+            ),
+        }
+
+    def extract_preference_candidates_node(state: RequirementState) -> dict:
+        _log_node(
+            state, "started", "extract_preference_candidates", state["status"]
+        )
+        try:
+            candidates = extract_memory_candidates(state["preference_evidence"])
+        except Exception:
+            logger.exception(
+                "memory.extraction_failed | thread_id=%s", state["thread_id"]
+            )
+            record_degradation("preference_extraction_failure")
+            record_memory_event(
+                TraceEventType.MEMORY_EXTRACTION_DEGRADED,
+                status="degraded",
+                operation="memory.extract_preferences",
+                attributes={"reason_code": "extractor_failure"},
+            )
+            return {
+                "preference_learning_status": PreferenceLearningStatus.DEGRADED
+            }
+        logger.info(
+            "memory.extraction_completed | thread_id=%s candidate_count=%s",
+            state["thread_id"],
+            len(candidates),
+        )
+        record_memory_event(
+            TraceEventType.MEMORY_EXTRACTION_COMPLETED,
+            status="success",
+            operation="memory.extract_preferences",
+            attributes={
+                "evidence_count": len(state["preference_evidence"]),
+                "extracted_count": len(candidates),
+            },
+        )
+        _log_node(
+            state, "completed", "extract_preference_candidates", state["status"]
+        )
+        return {"extracted_preference_candidates": candidates}
+
+    def validate_preference_candidates_node(state: RequirementState) -> dict:
+        _log_node(
+            state, "started", "validate_preference_candidates", state["status"]
+        )
+        if state["preference_learning_status"] is PreferenceLearningStatus.DEGRADED:
+            return {}
+        accepted, rejected = check_preference_candidates(
+            state["extracted_preference_candidates"]
+        )
+        logger.info(
+            "memory.candidates_validated | thread_id=%s accepted=%s rejected=%s "
+            "reason_codes=%s",
+            state["thread_id"],
+            len(accepted),
+            len(rejected),
+            ",".join(sorted({item.reason_code for item in rejected})) or "none",
+        )
+        if rejected:
+            record_memory_event(
+                TraceEventType.MEMORY_CANDIDATE_REJECTED,
+                status="rejected",
+                operation="memory.validate_candidates",
+                attributes={
+                    "accepted_count": len(accepted),
+                    "rejected_count": len(rejected),
+                    "reason_code": ",".join(
+                        sorted({item.reason_code for item in rejected})
+                    ),
+                },
+            )
+        _log_node(
+            state, "completed", "validate_preference_candidates", state["status"]
+        )
+        return {
+            "accepted_preference_candidates": accepted,
+            "rejected_preference_candidates": rejected,
+        }
+
+    async def create_memory_proposals(state: RequirementState) -> dict:
+        _log_node(state, "started", "create_memory_proposals", state["status"])
+        assert memory_service is not None
+        if state["preference_learning_status"] is PreferenceLearningStatus.DEGRADED:
+            return {}
+        principal = Principal(
+            tenant_id=state["tenant_id"],
+            user_id=state["user_id"],
+            scopes=frozenset({"preferences:read", "preferences:write"}),
+        )
+        proposals = []
+        deduplicated = 0
+        try:
+            for candidate in state["accepted_preference_candidates"][:5]:
+                content_hash = preference_content_hash(
+                    category=candidate.category,
+                    value=candidate.value,
+                    scope=candidate.scope,
+                    scope_key=candidate.scope_key,
+                )
+                confirmed = await memory_service.repository.find_content_hash(
+                    principal.tenant_id, principal.user_id, content_hash
+                )
+                if confirmed is not None:
+                    deduplicated += 1
+                    continue
+                pending = await memory_service.repository.find_pending_proposal(
+                    principal.tenant_id, principal.user_id, content_hash
+                )
+                if pending is not None:
+                    deduplicated += 1
+                    proposals.append(pending)
+                    continue
+                proposal = await memory_service.propose(
+                    principal,
+                    MemoryProposalRequest(
+                        category=candidate.category,
+                        value=candidate.value,
+                        scope=candidate.scope,
+                        scope_key=candidate.scope_key,
+                        source=candidate.source,
+                        source_run_id=current_run_id() or state["thread_id"],
+                        confidence=candidate.confidence,
+                        reason=candidate.reason,
+                    ),
+                )
+                proposals.append(proposal)
+        except Exception:
+            logger.exception(
+                "memory.proposal_pipeline_failed | thread_id=%s",
+                state["thread_id"],
+            )
+            record_degradation("preference_proposal_failure")
+            record_memory_event(
+                TraceEventType.MEMORY_EXTRACTION_DEGRADED,
+                status="degraded",
+                operation="memory.create_proposals",
+                attributes={"reason_code": "proposal_persistence_failure"},
+            )
+            return {
+                "memory_proposals": proposals,
+                "preference_deduplicated_count": deduplicated,
+                "preference_learning_status": PreferenceLearningStatus.DEGRADED,
+            }
+        status = (
+            PreferenceLearningStatus.COMPLETED
+            if state["preference_evidence"]
+            else PreferenceLearningStatus.SKIPPED
+        )
+        logger.info(
+            "memory.proposals_ready | thread_id=%s proposal_count=%s "
+            "deduplicated_count=%s",
+            state["thread_id"],
+            len(proposals),
+            deduplicated,
+        )
+        if deduplicated:
+            record_memory_event(
+                TraceEventType.MEMORY_CANDIDATE_DEDUPLICATED,
+                status="deduplicated",
+                operation="memory.create_proposals",
+                attributes={"deduplicated_count": deduplicated},
+            )
+        _log_node(state, "completed", "create_memory_proposals", state["status"])
+        return {
+            "memory_proposals": proposals,
+            "preference_deduplicated_count": deduplicated,
+            "preference_learning_status": status,
+        }
+
+    def finalize_response(state: RequirementState) -> dict:
+        _log_node(state, "completed", "finalize_response", state["status"])
+        return {}
 
     builder = StateGraph(RequirementState)
 
@@ -565,7 +816,13 @@ def build_requirement_workflow(
     add_node("assemble_trip_spec", assemble_trip_spec)
     if memory_service is not None:
         add_node("retrieve_relevant_preferences", retrieve_preferences)
-    add_node("execute_planning", execute_planning, terminal=True)
+    add_node("execute_planning", execute_planning, terminal=memory_service is None)
+    if memory_service is not None:
+        add_node("prepare_memory_evidence", prepare_memory_evidence)
+        add_node("extract_preference_candidates", extract_preference_candidates_node)
+        add_node("validate_preference_candidates", validate_preference_candidates_node)
+        add_node("create_memory_proposals", create_memory_proposals)
+        add_node("finalize_response", finalize_response, terminal=True)
     builder.add_edge(START, "execution_budget_guard")
     builder.add_edge("execution_budget_guard", "parse_requirement")
     builder.add_edge("parse_requirement", "validate_requirement")
@@ -598,7 +855,17 @@ def build_requirement_workflow(
     else:
         builder.add_edge("assemble_trip_spec", "retrieve_relevant_preferences")
         builder.add_edge("retrieve_relevant_preferences", "execute_planning")
-    builder.add_edge("execute_planning", END)
+    if memory_service is None:
+        builder.add_edge("execute_planning", END)
+    else:
+        builder.add_edge("execute_planning", "prepare_memory_evidence")
+        builder.add_edge("prepare_memory_evidence", "extract_preference_candidates")
+        builder.add_edge(
+            "extract_preference_candidates", "validate_preference_candidates"
+        )
+        builder.add_edge("validate_preference_candidates", "create_memory_proposals")
+        builder.add_edge("create_memory_proposals", "finalize_response")
+        builder.add_edge("finalize_response", END)
     resolved_checkpointer = checkpointer or ObservedCheckpointSaver(
         InMemorySaver(serde=requirement_checkpoint_serializer())
     )
@@ -639,6 +906,13 @@ def initial_requirement_state(
         "preference_context": None,
         "personalized_fields": [],
         "planning_response": None,
+        "preference_evidence": [],
+        "extracted_preference_candidates": [],
+        "accepted_preference_candidates": [],
+        "rejected_preference_candidates": [],
+        "memory_proposals": [],
+        "preference_learning_status": PreferenceLearningStatus.NOT_RUN,
+        "preference_deduplicated_count": 0,
         "status": "started",
         "message": None,
     }
@@ -663,7 +937,7 @@ def response_from_requirement_state(
     return NaturalPlanningResponse(
         thread_id=state["thread_id"],
         status=cast(
-            Literal["completed", "infeasible", "needs_clarification"],
+            Literal["completed", "infeasible", "needs_clarification", "failed"],
             state["status"],
         ),
         trip=state["trip"],
@@ -675,6 +949,11 @@ def response_from_requirement_state(
         planning=state["planning_response"],
         preference_context=state["preference_context"],
         personalized_fields=state["personalized_fields"],
+        preference_learning_status=state["preference_learning_status"],
+        memory_proposals=state["memory_proposals"],
+        preference_extracted_count=len(state["extracted_preference_candidates"]),
+        preference_rejected_count=len(state["rejected_preference_candidates"]),
+        preference_deduplicated_count=state["preference_deduplicated_count"],
         message=state["message"],
     )
 

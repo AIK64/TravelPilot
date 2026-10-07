@@ -174,6 +174,11 @@ def create_app(
             "X-User-Id",
             "X-Scopes",
         ],
+        expose_headers=[
+            "X-Agent-Run-Id",
+            "X-Agent-Thread-Id",
+            "X-Agent-Trace-Status",
+        ],
     )
     app.include_router(router)
     app.include_router(preference_router)

@@ -1,15 +1,50 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import logging
 from time import monotonic
 from typing import Callable
 from uuid import uuid4
 
 from travel_agent.execution.budget import ExecutionLedger
+from travel_agent.execution.file_trace import bounded_action_details
 from travel_agent.execution.models import JsonScalar, TraceEvent, TraceEventType, TraceStatus
 
 
+logger = logging.getLogger(__name__)
+
+
 _SAFE_ATTRIBUTE_KEYS = {
+    "action_kind",
+    "action_fingerprint",
+    "tool_name",
+    "schema_name",
+    "arguments_hash",
+    "evidence_id",
+    "evidence_kind",
+    "evidence_count",
+    "gap_count",
+    "required_gap_count",
+    "candidate_id",
+    "violation_fingerprint",
+    "decision_round",
+    "guard_result",
+    "terminal_reason",
+    "evidence_count",
+    "extracted_count",
+    "accepted_count",
+    "rejected_count",
+    "deduplicated_count",
+    "proposal_count",
+    "reason_code",
+    "policy_version",
+    "mode",
+    "confidence",
+    "confirmed",
+    "candidate_count",
+    "day_count",
+    "start_role",
+    "end_role",
     "provider",
     "thread_id",
     "category",
@@ -60,7 +95,7 @@ _SAFE_ATTRIBUTE_KEYS = {
 
 
 class TraceRecorder:
-    """Run 内同步收集安全事件，结束时由 Repository 一次性持久化。"""
+    """Run 内同步收集安全事件，并把每个新事件交给实时 Trace Sink。"""
 
     def __init__(
         self,
@@ -71,6 +106,8 @@ class TraceRecorder:
         utcnow: Callable[[], datetime] | None = None,
         monotonic_clock: Callable[[], float] = monotonic,
         id_factory: Callable[[], str] | None = None,
+        event_sink: Callable[[TraceEvent], None] | None = None,
+        file_detail_sink: Callable[[TraceEvent, dict[str, object]], None] | None = None,
     ) -> None:
         self.run_id = run_id
         self.ledger = ledger
@@ -79,6 +116,8 @@ class TraceRecorder:
         self._clock = monotonic_clock
         self._started = monotonic_clock()
         self._id_factory = id_factory or (lambda: str(uuid4()))
+        self._event_sink = event_sink
+        self._file_detail_sink = file_detail_sink
         self._events: list[TraceEvent] = []
         self.degraded_reasons: list[str] = []
         self._degraded = False
@@ -106,6 +145,7 @@ class TraceRecorder:
         attempt: int | None = None,
         plan_version_id: str | None = None,
         attributes: dict[str, JsonScalar] | None = None,
+        file_details: dict[str, object] | None = None,
     ) -> TraceEvent | None:
         budget = self.ledger.budget
         normal_limit = budget.max_trace_events - budget.terminal_trace_reserve
@@ -142,6 +182,18 @@ class TraceRecorder:
         )
         self._events.append(event)
         self.ledger.note_trace_event()
+        if self._event_sink is not None:
+            self._event_sink(event)
+        if self._file_detail_sink is not None and file_details is not None:
+            try:
+                self._file_detail_sink(event, bounded_action_details(file_details))
+            except Exception as error:
+                self.mark_degraded()
+                self.add_degradation("trace_detail_serialization_failure")
+                logger.warning(
+                    "agent_run.trace_details_failed | run_id=%s event_id=%s error_type=%s",
+                    self.run_id, event.event_id, type(error).__name__,
+                )
         return event
 
     def mark_degraded(self) -> None:

@@ -13,6 +13,7 @@ from travel_agent.execution.models import AgentRunRecord, RunStatus, TraceEvent
 
 class RunRepository(Protocol):
     async def create(self, run: AgentRunRecord) -> None: ...
+    async def append_trace_event(self, event: TraceEvent) -> None: ...
     async def finalize(
         self, run: AgentRunRecord, events: tuple[TraceEvent, ...]
     ) -> None: ...
@@ -47,6 +48,15 @@ class InMemoryRunRepository:
             if run.run_id in self._runs:
                 raise ValueError(f"duplicate run_id: {run.run_id}")
             self._runs[run.run_id] = run
+
+    async def append_trace_event(self, event: TraceEvent) -> None:
+        async with self._lock:
+            if event.run_id not in self._runs:
+                raise RunNotFoundError(event.run_id)
+            values = self._events.get(event.run_id, ())
+            if any(item.sequence == event.sequence for item in values):
+                return
+            self._events[event.run_id] = (*values, event)
 
     async def finalize(
         self, run: AgentRunRecord, events: tuple[TraceEvent, ...]
@@ -154,6 +164,27 @@ class SQLiteRunRepository:
                 self._row(run),
             )
             self._connection.commit()
+
+    async def append_trace_event(self, event: TraceEvent) -> None:
+        async with self._lock:
+            cursor = self._connection.execute(
+                "INSERT OR IGNORE INTO trace_events(run_id,sequence,payload) "
+                "SELECT ?,?,? WHERE EXISTS "
+                "(SELECT 1 FROM agent_runs WHERE run_id=?)",
+                (
+                    event.run_id,
+                    event.sequence,
+                    event.model_dump_json(),
+                    event.run_id,
+                ),
+            )
+            self._connection.commit()
+            if cursor.rowcount == 0:
+                run_exists = self._connection.execute(
+                    "SELECT 1 FROM agent_runs WHERE run_id=?", (event.run_id,)
+                ).fetchone()
+                if run_exists is None:
+                    raise RunNotFoundError(event.run_id)
 
     async def finalize(
         self, run: AgentRunRecord, events: tuple[TraceEvent, ...]

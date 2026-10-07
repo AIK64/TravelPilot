@@ -188,6 +188,7 @@ def _route_reason(args: tuple[Any, ...]) -> str:
 
 
 _REPAIR_NODES = {
+    "apply_repair",
     "apply_local_repair",
     "apply_soft_repair",
     "build_local_preview",
@@ -221,7 +222,7 @@ def _record_domain_event(context, graph: str, node: str, result: Any) -> None:
             graph=graph,
             node=node,
         )
-    elif node in {"apply_local_repair", "apply_soft_repair"}:
+    elif node in {"apply_repair", "apply_local_repair", "apply_soft_repair"}:
         context.trace.record(
             TraceEventType.REPAIR_APPLIED,
             status="applied",

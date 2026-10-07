@@ -9,6 +9,8 @@ from travel_agent.execution.models import (
     ExecutionBudget,
     RunKind,
     RunStatus,
+    TraceEvent,
+    TraceEventType,
 )
 from travel_agent.execution.repository import SQLiteRunRepository
 
@@ -27,14 +29,27 @@ async def test_sqlite_run_repository_survives_reopen(tmp_path):
         config_fingerprint="config",
     )
     await first.create(run)
+    event = TraceEvent(
+        event_id="event-1",
+        run_id=run.run_id,
+        sequence=1,
+        event_type=TraceEventType.RUN_STARTED,
+        timestamp=datetime.now(timezone.utc),
+        monotonic_offset_ms=0,
+        status="running",
+    )
+    await first.append_trace_event(event)
+    assert (await first.trace(run.run_id))[0].event_id == "event-1"
     completed = run.model_copy(update={"status": RunStatus.COMPLETED})
-    await first.finalize(completed, ())
+    await first.finalize(completed, (event,))
     await first.close()
 
     second = SQLiteRunRepository(str(path))
     restored = await second.get("sqlite-run")
     listed = await second.list_for_thread("thread-sqlite")
+    restored_events = await second.trace("sqlite-run")
     await second.close()
 
     assert restored.status is RunStatus.COMPLETED
     assert listed[0].run_id == "sqlite-run"
+    assert restored_events[0].event_id == "event-1"

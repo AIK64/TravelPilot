@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from collections.abc import Awaitable, Callable
 from uuid import uuid4
 
 from langgraph.graph.state import CompiledStateGraph
@@ -14,7 +16,7 @@ from travel_agent.domain.lifecycle_models import (
     PlanSessionResponse,
     PlanSessionStatus,
 )
-from travel_agent.domain.models import PlanningRequest
+from travel_agent.domain.models import PlanningRequest, PlanningResponse
 from travel_agent.domain.weather_models import (
     RefreshWeatherAction,
     WeatherEventView,
@@ -22,7 +24,11 @@ from travel_agent.domain.weather_models import (
     WeatherStateView,
 )
 from travel_agent.graph.workflow import run_planning
-from travel_agent.lifecycle.errors import LifecycleActionError, LifecycleConflictError
+from travel_agent.lifecycle.errors import (
+    LifecycleActionError,
+    LifecycleConflictError,
+    LifecycleNotFoundError,
+)
 from travel_agent.lifecycle.repository import PlanRepository
 from travel_agent.lifecycle.workflow import (
     response_from_session,
@@ -37,18 +43,23 @@ from travel_agent.requirements.workflow import resume_natural_planning, run_natu
 from travel_agent.weather.persistence import weather_state_view
 
 
+logger = logging.getLogger(__name__)
+
+
 class PlanLifecycleService:
     def __init__(
         self,
         *,
         repository: PlanRepository,
         planning_workflow: CompiledStateGraph,
+        planning_runner: Callable[[PlanningRequest, str], Awaitable[PlanningResponse]] | None = None,
         lifecycle_workflow: CompiledStateGraph,
         requirement_workflow: CompiledStateGraph | None,
         weather_stale_max_seconds: int = 21_600,
     ) -> None:
         self._repository = repository
         self._planning_workflow = planning_workflow
+        self._planning_runner = planning_runner
         self._lifecycle_workflow = lifecycle_workflow
         self._requirement_workflow = requirement_workflow
         self._weather_stale_max_seconds = weather_stale_max_seconds
@@ -64,8 +75,12 @@ class PlanLifecycleService:
     ) -> PlanSessionResponse:
         resolved_id = session_id or str(uuid4())
         planning_thread_id = f"planning:{resolved_id}"
-        response = await run_planning(
-            self._planning_workflow, request, thread_id=planning_thread_id
+        response = (
+            await self._planning_runner(request, planning_thread_id)
+            if self._planning_runner is not None
+            else await run_planning(
+                self._planning_workflow, request, thread_id=planning_thread_id
+            )
         )
         if response.status != "completed" or response.selected_plan is None:
             raise LifecycleActionError(
@@ -89,6 +104,60 @@ class PlanLifecycleService:
             session,
             weather_stale_max_seconds=self._weather_stale_max_seconds,
         )
+
+    async def create_from_checkpoint(
+        self,
+        thread_id: str,
+        *,
+        session_id: str,
+        tenant_id: str,
+        user_id: str,
+    ) -> PlanSessionResponse:
+        """把已完成的自然语言规划接入选择 Interrupt，不重复调用模型或工具。"""
+        async with self._locks.setdefault(session_id, asyncio.Lock()):
+            try:
+                existing = await self._repository.get(session_id)
+            except LifecycleNotFoundError:
+                existing = None
+            if existing is not None:
+                if existing.tenant_id != tenant_id or existing.user_id != user_id:
+                    raise LifecycleConflictError(session_id, code="session_owner_mismatch")
+                logger.info("lifecycle.selection_session.reused | session_id=%s", session_id)
+                return await self.get(session_id)
+            if self._requirement_workflow is None:
+                raise RuntimeError("natural-language planning is not configured")
+            state = await self._requirement_workflow.aget_state(
+                {"configurable": {"thread_id": thread_id}}
+            )
+            values = state.values
+            if (
+                values.get("status") != "completed"
+                or values.get("tenant_id") != tenant_id
+                or values.get("user_id") != user_id
+            ):
+                raise LifecycleActionError(
+                    session_id, "planning_not_completed", "没有可用于选择的已完成规划，请重新生成计划"
+                )
+            session = PlanSessionRecord(
+                session_id=session_id,
+                lifecycle_thread_id=f"lifecycle:{session_id}",
+                intake_thread_id=thread_id,
+                status=PlanSessionStatus.AWAITING_CANDIDATE_SELECTION,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                snapshot=await self._planning_snapshot(thread_id),
+            )
+            await self._repository.create(session)
+            logger.info(
+                "lifecycle.selection_session.created | session_id=%s source_thread_id=%s candidate_count=%s",
+                session_id, thread_id, len(session.snapshot.candidates),
+            )
+            return await start_lifecycle(
+                self._lifecycle_workflow,
+                self._repository,
+                session,
+                weather_stale_max_seconds=self._weather_stale_max_seconds,
+            )
 
     async def create_from_text(
         self,
@@ -353,6 +422,17 @@ class PlanLifecycleService:
         selected = values.get("selected_plan")
         if selected is None:
             raise RuntimeError("completed planning checkpoint has no selected plan")
+        kernel_snapshot = values.get("kernel_snapshot")
+        if kernel_snapshot is not None:
+            return PlanningSnapshot(
+                trip=values["trip"],
+                candidates=tuple(values["candidates"]),
+                recommended_candidate_id=selected.id,
+                candidate_drafts=tuple(kernel_snapshot.candidate_drafts),
+                planning_pois=tuple(kernel_snapshot.planning_pois),
+                route_results=dict(kernel_snapshot.route_results),
+                critic_status=values.get("critic_status", "not_run"),
+            )
         return PlanningSnapshot(
             trip=values["trip"],
             candidates=tuple(values["candidates"]),

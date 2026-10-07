@@ -58,6 +58,7 @@ class ToolErrorCategory(StrEnum):
 class POISearchQuery(BaseModel):
     city: str
     keyword: str
+    types: str = ""
     exact_match: bool = False
     limit: int = Field(default=10, ge=1, le=25)
     priority: int = 0
@@ -90,8 +91,8 @@ class RouteQuery(BaseModel):
 
 
 class RouteResult(BaseModel):
-    distance_meters: int = Field(gt=0)
-    duration_minutes: int = Field(gt=0)
+    distance_meters: int = Field(ge=0)
+    duration_minutes: int = Field(ge=0)
     mode: RouteMode = RouteMode.DRIVING
     provider: str
     data_confidence: float = Field(ge=0, le=1)

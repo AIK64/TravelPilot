@@ -70,3 +70,27 @@ def test_async_run_api_owner_trace_sse_and_completed_cancel(hangzhou_trip) -> No
         )
         assert cancelled.status_code == 200
         assert cancelled.json()["status"] == record["status"]
+
+
+def test_natural_plan_stream_emits_trace_before_result() -> None:
+    complete_text = (
+        "2026年10月2日到10月4日去杭州，3个人，预算1500元，住西湖东侧，"
+        "喜欢自然和美食，2日10:30到杭州东站，4日19:00从杭州东站离开，"
+        "灵隐寺必须去，不想太累。"
+    )
+    with TestClient(create_app(Settings.from_env({}))) as client:
+        response = client.post(
+            "/api/v1/plans/from-text/stream",
+            headers={**OWNER, "Accept": "text/event-stream"},
+            json={"text": complete_text, "reference_date": "2026-08-23"},
+        )
+
+        assert response.status_code == 200
+        assert response.headers["x-agent-run-id"]
+        assert response.headers["x-agent-thread-id"]
+        assert response.text.index("event: trace") < response.text.index(
+            "event: result"
+        )
+        assert "event: end" in response.text
+        assert '"event_type":"run.started"' in response.text
+        assert '"status":"completed"' in response.text

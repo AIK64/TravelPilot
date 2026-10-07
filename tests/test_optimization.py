@@ -11,6 +11,42 @@ from travel_agent.domain.tool_models import RouteMode, UnknownFactPolicy
 from travel_agent.graph.workflow import build_workflow, run_planning
 from travel_agent.planning.defaults import POIDefaultPolicy
 from travel_agent.planning.policy import PlanningPolicy
+from travel_agent.planning.poi_identity import normalize_poi_name
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness_name", ["workflow_harness", "fallback_workflow_harness"])
+async def test_alias_attractions_are_not_repeated_in_materialized_plans(
+    hangzhou_trip, harness_name, request, monkeypatch
+):
+    harness = request.getfixturevalue(harness_name)
+    original_search = harness.poi_provider.search_pois
+
+    async def duplicate_search(query):
+        facts = await original_search(query)
+        return [
+            *facts,
+            *(fact.model_copy(update={"id": f"alias-{fact.id}"}) for fact in facts),
+        ]
+
+    monkeypatch.setattr(harness.poi_provider, "search_pois", duplicate_search)
+    response = await run_planning(
+        harness.workflow,
+        PlanningRequest(trip=hangzhou_trip, max_replan_rounds=2),
+        thread_id=f"unique-attractions-{harness_name}",
+    )
+    assert response.status == "completed"
+    assert len(response.candidates) == 3
+    for candidate in response.candidates:
+        names = [
+            normalize_poi_name(item.name)
+            for day in candidate.days
+            for item in day.items
+            if item.type.value == "activity"
+        ]
+        assert len(names) == len(set(names))
+        assert names.count("灵隐寺") == 1
+    assert response.selected_plan.validation.valid
 
 
 @pytest.mark.asyncio

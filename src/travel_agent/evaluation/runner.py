@@ -48,7 +48,10 @@ async def run_release_evaluation(
     root = manifest_path.resolve().parents[2]
     dataset_path = root / manifest.base_dataset
     source_cases = load_jsonl(dataset_path)
-    active_settings = settings or Settings.from_env({})
+    # Release 数据集及既有阈值来自固定工作流；生产默认切换后仍显式复现实验基线。
+    active_settings = settings or Settings.from_env(
+        {"AGENT_MODE": "fixed_workflow"}
+    )
     random.seed(random_seed)
     runtime = await PlanningRuntime.create(active_settings)
     started = datetime.now(timezone.utc)
@@ -217,10 +220,15 @@ def _stable_domain_value(value: object) -> object:
         "message",
         "elapsed_ms",
         "fetched_at",
+        "created_at",
+        "resolved_at",
         "expires_at",
         "cache_hit",
         "attempt_count",
         "interrupt",
+        "proposal_id",
+        "memory_id",
+        "source_run_id",
     }
     if isinstance(value, dict):
         return {

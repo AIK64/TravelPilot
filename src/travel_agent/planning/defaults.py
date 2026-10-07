@@ -1,6 +1,8 @@
 """以显式、可追溯 policy 处理 POI 的未知事实。"""
 
 from datetime import date, timedelta
+from decimal import Decimal
+import logging
 
 from travel_agent.domain.models import (
     POIResolution,
@@ -18,8 +20,10 @@ PlanningPOI.model_rebuild(_types_namespace=_MODEL_TYPES)
 POIResolution.model_rebuild(_types_namespace=_MODEL_TYPES)
 
 
-DEFAULT_OPENING_WINDOW = TimeWindow(start="10:00", end="16:00")
-DEFAULT_DURATION_MINUTES = 90
+DEFAULT_OPENING_WINDOW = TimeWindow(start="08:00", end="18:00")
+DEFAULT_DURATION_MINUTES = 120
+DEFAULT_COST_PER_PERSON = Decimal("45")
+logger = logging.getLogger(__name__)
 CONFIDENCE_DEDUCTION_PER_ASSUMPTION = 0.15
 MINIMUM_CONFIDENCE = 0.1
 
@@ -48,12 +52,15 @@ class POIDefaultPolicy:
         party_cost = (
             facts.average_cost_per_person * trip.travelers
             if facts.average_cost_per_person is not None
-            else None
+            else DEFAULT_COST_PER_PERSON * trip.travelers
         )
         data_confidence = max(
             MINIMUM_CONFIDENCE,
             facts.data_confidence - CONFIDENCE_DEDUCTION_PER_ASSUMPTION * len(assumptions),
         )
+        if missing_fields:
+            logger.info("planning.poi_defaults poi_id=%s fields=%s duration_minutes=%s party_cost=%s",
+                        facts.id, ",".join(missing_fields), duration_minutes, party_cost)
         return POIResolution(
             poi=PlanningPOI(
                 facts=facts,
@@ -108,7 +115,7 @@ class POIDefaultPolicy:
     ) -> list[PlanningAssumption]:
         details = {
             "opening_window": (
-                "10:00-16:00",
+                "08:00-18:00",
                 "Provider 未提供适用于全部行程日期的营业时间，按默认 policy 补齐。",
             ),
             "duration_minutes": (
@@ -116,8 +123,8 @@ class POIDefaultPolicy:
                 "Provider 未提供建议游览时长，按默认 policy 估算。",
             ),
             "party_cost": (
-                "unknown",
-                "Provider 未提供人均费用，费用保持未知而不进行猜测。",
+                str(DEFAULT_COST_PER_PERSON),
+                "Provider 未提供人均费用，按每人45元估算，规划费用乘以出行人数。",
             ),
         }
         return [

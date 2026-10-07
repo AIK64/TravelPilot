@@ -124,6 +124,10 @@ PATCH  /api/v1/profile/personalization
 
 LLM 推断只能创建 Proposal，不能直接写入已确认 Memory。当前请求中的显式值始终优先；冲突类别整体排除并产生 Trace，不静默合并。
 
+规划成功后，Requirement Graph 会继续执行 `prepare_memory_evidence → extract_preference_candidates → validate_preference_candidates → create_memory_proposals`。证据只来自用户原始需求和澄清回答，不从 Agent 自己生成的行程反推偏好；带“这次/本次”等限定的临时要求会被拒绝，其他候选最多生成 5 条待确认 Proposal。相同的已确认 Memory 或待处理 Proposal 会被去重，提取或持久化失败只把 `preference_learning_status` 标记为 `degraded`，不会把已经完成的规划改成失败。
+
+相关 Trace 包括 `memory.extraction_started`、`memory.extraction_completed`、`memory.candidate_rejected`、`memory.candidate_deduplicated`、`memory.proposal_created` 和 `memory.extraction_degraded`。前端会在规划结果旁展示待确认提案，只有用户点击确认后才写入长期 Memory。
+
 ## 6. 异步 Run 与 SSE
 
 ```text
@@ -132,9 +136,13 @@ POST /api/v1/trips/{trip_id}/runs
 GET  /api/v1/runs/{run_id}
 GET  /api/v1/runs/{run_id}/events
 POST /api/v1/runs/{run_id}/cancel
+POST /api/v1/plans/from-text/stream
+POST /api/v1/plans/from-text/{thread_id}/resume/stream
 ```
 
-第二个请求返回 HTTP 202 和 `RunHandle`。SSE 使用 `Last-Event-ID` 或 `after_sequence` 续传持久化 Trace；Run 完成后发送 `event: end`。本地模式使用进程内任务，生产设置 `ASYNC_EXECUTION_BACKEND=redis` 后由 `travel-agent-worker` 执行。
+第二个请求返回 HTTP 202 和 `RunHandle`。`TraceRecorder` 产生事件后，经有序异步 Writer 逐条追加到 Run Repository；SSE 因而能在 Run 仍为 `running` 时看到 Node、Tool、Validator 和 Repair 事件，而不是等终态批量写入。终态 `finalize` 会幂等补齐完整轨迹。
+
+`GET /runs/{run_id}/events` 使用 `Last-Event-ID` 或 `after_sequence` 续传，Run 完成后发送 `event: end`。两个自然语言流式接口在同一 SSE 中依次发送 `trace`、`result`、`end`，前端提交后即可展示实时轨迹；连接中断会取消对应的流式 Run。本地模式使用进程内任务，生产设置 `ASYNC_EXECUTION_BACKEND=redis` 后由 `travel-agent-worker` 执行结构化异步 Run。
 
 ## 7. MCP
 

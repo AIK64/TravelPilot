@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from travel_agent.planning.search_plan import build_search_plan
 
 
@@ -9,7 +11,9 @@ def test_must_visit_queries_precede_interests(hangzhou_trip):
 
     assert queries[0].keyword == "灵隐寺"
     assert queries[0].exact_match is True
-    assert [query.keyword for query in queries[1:]] == ["自然", "美食", "人文"]
+    assert [query.keyword for query in queries[1:]] == ["景点"]
+    assert queries[1].types == "110000"
+    assert queries[0].types == ""
 
 
 def test_empty_preferences_use_scenic_default(hangzhou_trip):
@@ -32,7 +36,7 @@ def test_duplicate_or_blank_terms_do_not_create_duplicate_queries(hangzhou_trip)
 
     assert [(query.keyword, query.exact_match, query.priority, query.limit) for query in queries] == [
         ("灵隐寺", True, 100, 7),
-        ("美食", False, 50, 7),
+        ("景点", False, 50, 7),
     ]
 
 
@@ -47,12 +51,13 @@ def test_search_plan_caps_queries_after_stable_must_visit_first_deduplication(
         }
     )
 
-    queries = build_search_plan(
-        trip,
-        per_query_limit=1,
-        max_queries=2,
-    )
+    # 不静默丢弃必去目标；预算不足时明确拒绝。
+    with pytest.raises(ValueError, match="must_visit query count"):
+        build_search_plan(trip, per_query_limit=1, max_queries=2)
 
-    assert [query.keyword for query in queries] == ["必去甲", "必去乙"]
-    assert all(query.exact_match for query in queries)
+    queries = build_search_plan(trip, per_query_limit=1, max_queries=4)
+
+    assert [query.keyword for query in queries] == ["必去甲", "必去乙", "必去丙", "景点"]
+    assert all(query.exact_match for query in queries[:3])
+    assert not queries[3].exact_match
     assert all(query.limit == 1 for query in queries)

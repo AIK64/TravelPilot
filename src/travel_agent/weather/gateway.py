@@ -71,6 +71,7 @@ class WeatherToolGateway:
             ttl_seconds=self._location_ttl,
             operation="weather.resolve_location",
             context=context,
+            request={"destination": destination},
             call=lambda: self._provider.resolve_location(destination),
         )
 
@@ -90,6 +91,7 @@ class WeatherToolGateway:
             ttl_seconds=self._forecast_ttl,
             operation="weather.get_forecast",
             context=context,
+            request={"location": location, "start_date": start_date.isoformat(), "end_date": end_date.isoformat()},
             call=lambda: self._provider.get_forecast(
                 location, start_date=start_date, end_date=end_date
             ),
@@ -103,10 +105,11 @@ class WeatherToolGateway:
         operation: str,
         context: ToolCallContext,
         call: Callable[[], Awaitable[T]],
+        request: object = None,
     ) -> ToolResult[T]:
         provider = self._provider.name
         parent_event_id = begin_tool(
-            operation, provider=provider, thread_id=context.thread_id
+            operation, provider=provider, thread_id=context.thread_id, request=request
         )
         logger.info(
             "weather.tool.started | thread_id=%s provider=%s operation=%s",
@@ -213,6 +216,8 @@ class WeatherToolGateway:
             elapsed_ms=result.elapsed_ms,
             error_code=result.error.code if result.error is not None else None,
             parent_event_id=parent_event_id,
+            request=request,
+            result=result,
         )
         return result
 

@@ -22,10 +22,11 @@ from travel_agent.execution.models import (
     RunStatus,
     RunTerminalReason,
     TraceEventType,
-    TraceStatus,
+    TraceEvent,
     safe_status_value,
 )
 from travel_agent.execution.repository import RunRepository
+from travel_agent.execution.file_trace import FileTraceSink
 from travel_agent.execution.tracing import TraceRecorder
 
 
@@ -39,6 +40,72 @@ class ExecutionResult(Generic[T]):
     run: AgentRunRecord | None
 
 
+@dataclass(frozen=True, slots=True)
+class _FileTraceDetails:
+    event: TraceEvent
+    details: dict[str, object]
+
+
+class _LiveTraceWriter:
+    """按 sequence 串行追加事件，避免同步的 Node 埋点阻塞 Graph。"""
+
+    def __init__(self, repository: RunRepository, run_id: str, trace_file_dir: str | None = None) -> None:
+        self.repository = repository
+        self.run_id = run_id
+        self._queue: asyncio.Queue[object] = asyncio.Queue()
+        self._stop = object()
+        self._failed = False
+        self._file_sink = FileTraceSink(trace_file_dir, run_id) if trace_file_dir else None
+        self._task = asyncio.create_task(
+            self._write_events(), name=f"live-trace:{run_id}"
+        )
+
+    @property
+    def failed(self) -> bool:
+        return self._failed
+
+    def publish(self, event) -> None:
+        self._queue.put_nowait(event)
+
+    def publish_details(self, event: TraceEvent, details: dict[str, object]) -> None:
+        if self._file_sink is not None:
+            self._queue.put_nowait(_FileTraceDetails(event, details))
+
+    async def close(self) -> None:
+        self._queue.put_nowait(self._stop)
+        await self._task
+
+    async def _write_events(self) -> None:
+        while True:
+            event = await self._queue.get()
+            try:
+                if event is self._stop:
+                    return
+                if not isinstance(event, _FileTraceDetails):
+                    try:
+                        await self.repository.append_trace_event(event)
+                    except Exception:
+                        self._failed = True
+                        logger.exception(
+                            "agent_run.live_trace_write_failed | run_id=%s", self.run_id
+                        )
+                # 两个输出独立失败；文件错误不终止规划或影响后续数据库事件。
+                if self._file_sink is not None:
+                    try:
+                        if isinstance(event, _FileTraceDetails):
+                            await asyncio.to_thread(self._file_sink.append_details, event.event, event.details)
+                        else:
+                            await asyncio.to_thread(self._file_sink.append, event)
+                    except Exception:
+                        self._failed = True
+                        logger.exception(
+                            "agent_run.file_trace_write_failed | run_id=%s", self.run_id
+                        )
+                        self._file_sink = None
+            finally:
+                self._queue.task_done()
+
+
 class RunCoordinator:
     def __init__(
         self,
@@ -46,11 +113,13 @@ class RunCoordinator:
         budget: ExecutionBudget,
         *,
         trace_attribute_max_chars: int = 256,
+        trace_file_dir: str | None = None,
         config_values: dict[str, object] | None = None,
     ) -> None:
         self.repository = repository
         self.budget = budget
         self.trace_attribute_max_chars = trace_attribute_max_chars
+        self.trace_file_dir = trace_file_dir
         encoded = json.dumps(
             config_values or {"budget": budget.model_dump(mode="json")},
             ensure_ascii=False,
@@ -106,10 +175,13 @@ class RunCoordinator:
             )
             await self.repository.create(record)
         ledger = ExecutionLedger(run_id, active_budget)
+        live_trace = _LiveTraceWriter(self.repository, run_id, self.trace_file_dir)
         trace = TraceRecorder(
             run_id,
             ledger,
             attribute_max_chars=self.trace_attribute_max_chars,
+            event_sink=live_trace.publish,
+            file_detail_sink=live_trace.publish_details if self.trace_file_dir else None,
         )
         context = RunContext(record, ledger, trace, FaultInjector(fault_plan))
         trace.record(
@@ -135,6 +207,8 @@ class RunCoordinator:
                 trace.record(
                     TraceEventType.RUN_INTERRUPTED
                     if status is RunStatus.INTERRUPTED
+                    else TraceEventType.RUN_FAILED
+                    if status is RunStatus.FAILED
                     else TraceEventType.RUN_COMPLETED,
                     status=status.value,
                     terminal=True,
@@ -164,6 +238,10 @@ class RunCoordinator:
                 terminal=True,
                 attributes={"terminal_reason": reason.value},
             )
+            await live_trace.close()
+            if live_trace.failed:
+                trace.add_degradation("live_trace_sink_failure")
+                trace.mark_degraded()
             failed = self._final_record(
                 record,
                 ledger=ledger,
@@ -173,14 +251,6 @@ class RunCoordinator:
             )
             await self._persist(failed, trace)
             raise
-        completed = self._final_record(
-            record,
-            ledger=ledger,
-            trace=trace,
-            status=status,
-            reason=reason,
-            plan_version_id=_plan_version_id(payload),
-        )
         trace_fault = context.faults.match(
             FaultPoint.TRACE_SINK, operation="finalize", attempt=1
         )
@@ -191,12 +261,18 @@ class RunCoordinator:
         }:
             trace.add_degradation("trace_sink_failure")
             trace.mark_degraded()
-            completed = completed.model_copy(
-                update={
-                    "trace_status": TraceStatus.DEGRADED,
-                    "degraded_reasons": tuple(trace.degraded_reasons),
-                }
-            )
+        await live_trace.close()
+        if live_trace.failed:
+            trace.add_degradation("live_trace_sink_failure")
+            trace.mark_degraded()
+        completed = self._final_record(
+            record,
+            ledger=ledger,
+            trace=trace,
+            status=status,
+            reason=reason,
+            plan_version_id=_plan_version_id(payload),
+        )
         await self._persist(completed, trace)
         logger.info(
             "agent_run.completed | run_id=%s kind=%s status=%s reason=%s steps=%s "
@@ -252,6 +328,8 @@ class RunCoordinator:
         thread_id: str | None = None,
         session_id: str | None = None,
         request_id: str | None = None,
+        parent_run_id: str | None = None,
+        causation_id: str | None = None,
         budget: ExecutionBudget | None = None,
         tenant_id: str = "local",
         user_id: str = "demo",
@@ -262,6 +340,8 @@ class RunCoordinator:
             thread_id=thread_id,
             session_id=session_id,
             request_id=request_id,
+            parent_run_id=parent_run_id,
+            causation_id=causation_id,
             budget=budget,
             tenant_id=tenant_id,
             user_id=user_id,
@@ -306,6 +386,14 @@ class RunCoordinator:
 
 def classify_payload(payload: object) -> tuple[RunStatus, RunTerminalReason]:
     status = safe_status_value(getattr(payload, "status", None))
+    if status == "failed":
+        planning = getattr(payload, "planning", None) or payload
+        reason = getattr(planning, "terminal_reason", None)
+        try:
+            terminal_reason = RunTerminalReason(reason)
+        except (ValueError, TypeError):
+            terminal_reason = RunTerminalReason.INVALID_AGENT_DECISION
+        return RunStatus.FAILED, terminal_reason
     interrupt = getattr(payload, "interrupt", None)
     if status in {"needs_clarification", "needs_requirement_clarification"}:
         return RunStatus.INTERRUPTED, RunTerminalReason.NEEDS_CLARIFICATION

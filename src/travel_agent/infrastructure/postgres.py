@@ -103,6 +103,23 @@ class PostgresRunRepository:
             run.model_dump_json(),
         )
 
+    async def append_trace_event(self, event: TraceEvent) -> None:
+        result = await self.pool.execute(
+            "INSERT INTO trace_events(run_id,sequence,payload) "
+            "SELECT $1,$2,$3::jsonb WHERE EXISTS "
+            "(SELECT 1 FROM agent_runs WHERE run_id=$1) "
+            "ON CONFLICT DO NOTHING",
+            event.run_id,
+            event.sequence,
+            event.model_dump_json(),
+        )
+        if result == "INSERT 0 0":
+            exists = await self.pool.fetchval(
+                "SELECT 1 FROM agent_runs WHERE run_id=$1", event.run_id
+            )
+            if exists is None:
+                raise RunNotFoundError(event.run_id)
+
     async def finalize(
         self, run: AgentRunRecord, events: tuple[TraceEvent, ...]
     ) -> None:
@@ -311,6 +328,21 @@ class PostgresPreferenceRepository:
             if error.__class__.__name__ == "UniqueViolationError":
                 raise MemoryConflictError("duplicate_proposal") from None
             raise
+
+    async def find_pending_proposal(
+        self, tenant_id: str, user_id: str, content_hash: str
+    ) -> MemoryProposal | None:
+        rows = await self.pool.fetch(
+            "SELECT payload FROM memory_proposals WHERE tenant_id=$1 AND user_id=$2 "
+            "AND status='pending'",
+            tenant_id,
+            user_id,
+        )
+        for row in rows:
+            item = MemoryProposal.model_validate(_payload(row))
+            if item.content_hash == content_hash and item.pending_at():
+                return item
+        return None
 
     async def get_proposal(
         self, tenant_id: str, user_id: str, proposal_id: str

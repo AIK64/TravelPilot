@@ -44,9 +44,26 @@ class WeatherProviderMode(StrEnum):
 
 
 class AgentMode(StrEnum):
+    FIXED_WORKFLOW = "fixed_workflow"
+    DYNAMIC_PLANNER = "dynamic_planner"
+    SHADOW_DYNAMIC_PLANNER = "shadow_dynamic_planner"
     SINGLE_GRAPH = "single_graph"
     SPECIALIST_SUBAGENTS = "specialist_subagents"
     SHADOW_SUBAGENTS = "shadow_subagents"
+
+
+class PlannerProviderMode(StrEnum):
+    MOCK = "mock"
+    OPENAI = "openai"
+    DEEPSEEK = "deepseek"
+
+
+class ReplannerProviderMode(StrEnum):
+    DISABLED = "disabled"
+    DETERMINISTIC = "deterministic"
+    MOCK = "mock"
+    OPENAI = "openai"
+    DEEPSEEK = "deepseek"
 
 
 class AsyncExecutionBackend(StrEnum):
@@ -127,8 +144,25 @@ class Settings:
     database_url: str = ""
     memory_context_max_tokens: int = 1_200
     memory_context_max_characters: int = 4_800
-    agent_mode: AgentMode = AgentMode.SINGLE_GRAPH
+    agent_mode: AgentMode = AgentMode.DYNAMIC_PLANNER
     agent_max_handoffs: int = 8
+    planner_provider: PlannerProviderMode = PlannerProviderMode.MOCK
+    planner_model: str = "mock-dynamic-planner-v1"
+    planner_timeout_seconds: float = 20.0
+    planner_max_attempts: int = 2
+    planner_max_output_tokens: int = 1_200
+    planner_max_decisions: int = 12
+    planner_max_invalid_actions: int = 2
+    planner_max_repeated_actions: int = 2
+    replanner_provider: ReplannerProviderMode = ReplannerProviderMode.DETERMINISTIC
+    replanner_model: str = "deterministic-replanner-v1"
+    replanner_timeout_seconds: float = 20.0
+    replanner_max_attempts: int = 2
+    replanner_max_output_tokens: int = 1_600
+    max_evidence_records: int = 256
+    max_observation_history: int = 8
+    max_planner_context_tokens: int = 6_000
+    max_replanner_context_tokens: int = 5_000
     dev_identity_enabled: bool = True
     dev_tenant_id: str = "local"
     dev_user_id: str = "demo"
@@ -162,6 +196,8 @@ class Settings:
     run_max_repeated_fingerprint_count: int = 2
     run_deadline_seconds: float = 120.0
     trace_attribute_max_chars: int = 256
+    trace_file_enabled: bool = True
+    trace_file_dir: str = ".data/traces"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -338,9 +374,56 @@ class Settings:
                 source.get("MEMORY_CONTEXT_MAX_CHARACTERS", "4800")
             ),
             agent_mode=AgentMode(
-                source.get("AGENT_MODE", "single_graph").strip().lower()
+                source.get("AGENT_MODE", "dynamic_planner").strip().lower()
             ),
             agent_max_handoffs=int(source.get("AGENT_MAX_HANDOFFS", "8")),
+            planner_provider=PlannerProviderMode(
+                source.get("PLANNER_PROVIDER", "mock").strip().lower()
+            ),
+            planner_model=source.get(
+                "PLANNER_MODEL", "mock-dynamic-planner-v1"
+            ).strip(),
+            planner_timeout_seconds=float(
+                source.get("PLANNER_TIMEOUT_SECONDS", "20")
+            ),
+            planner_max_attempts=int(source.get("PLANNER_MAX_ATTEMPTS", "2")),
+            planner_max_output_tokens=int(
+                source.get("PLANNER_MAX_OUTPUT_TOKENS", "1200")
+            ),
+            planner_max_decisions=int(
+                source.get("PLANNER_MAX_DECISIONS", "12")
+            ),
+            planner_max_invalid_actions=int(
+                source.get("PLANNER_MAX_INVALID_ACTIONS", "2")
+            ),
+            planner_max_repeated_actions=int(
+                source.get("PLANNER_MAX_REPEATED_ACTIONS", "2")
+            ),
+            replanner_provider=ReplannerProviderMode(
+                source.get("REPLANNER_PROVIDER", "deterministic").strip().lower()
+            ),
+            replanner_model=source.get(
+                "REPLANNER_MODEL", "deterministic-replanner-v1"
+            ).strip(),
+            replanner_timeout_seconds=float(
+                source.get("REPLANNER_TIMEOUT_SECONDS", "20")
+            ),
+            replanner_max_attempts=int(
+                source.get("REPLANNER_MAX_ATTEMPTS", "2")
+            ),
+            replanner_max_output_tokens=int(
+                source.get("REPLANNER_MAX_OUTPUT_TOKENS", "1600")
+            ),
+            max_evidence_records=int(source.get("MAX_EVIDENCE_RECORDS", "256")),
+            max_observation_history=int(
+                source.get("MAX_OBSERVATION_HISTORY", "8")
+            ),
+            max_planner_context_tokens=int(
+                source.get("MAX_PLANNER_CONTEXT_TOKENS", "6000")
+            ),
+            max_replanner_context_tokens=int(
+                source.get("MAX_REPLANNER_CONTEXT_TOKENS", "5000")
+            ),
             dev_identity_enabled=_parse_bool(
                 source.get("DEV_IDENTITY_ENABLED", "true"),
                 name="DEV_IDENTITY_ENABLED",
@@ -401,9 +484,23 @@ class Settings:
             trace_attribute_max_chars=int(
                 source.get("TRACE_ATTRIBUTE_MAX_CHARS", "256")
             ),
+            trace_file_enabled=_parse_bool(
+                source.get("TRACE_FILE_ENABLED", "true"), name="TRACE_FILE_ENABLED"
+            ),
+            trace_file_dir=source.get("TRACE_FILE_DIR", ".data/traces").strip(),
         )
         settings.validate()
         return settings
+
+    @property
+    def effective_agent_mode(self) -> AgentMode:
+        """把历史模式名映射到当前控制面，同时保留配置兼容性。"""
+
+        return {
+            AgentMode.SPECIALIST_SUBAGENTS: AgentMode.DYNAMIC_PLANNER,
+            AgentMode.SHADOW_SUBAGENTS: AgentMode.SHADOW_DYNAMIC_PLANNER,
+            AgentMode.SINGLE_GRAPH: AgentMode.FIXED_WORKFLOW,
+        }.get(self.agent_mode, self.agent_mode)
 
     def validate(self) -> None:
         if self.provider is ProviderMode.AMAP and not self.amap_api_key:
@@ -596,6 +693,44 @@ class Settings:
             )
         if not 1 <= self.agent_max_handoffs <= 100:
             raise ValueError("AGENT_MAX_HANDOFFS must be between 1 and 100")
+        if not self.planner_model:
+            raise ValueError("PLANNER_MODEL must not be blank")
+        if self.planner_provider is PlannerProviderMode.OPENAI and not self.openai_api_key:
+            raise ValueError("OPENAI_API_KEY is required when PLANNER_PROVIDER=openai")
+        if self.planner_provider is PlannerProviderMode.DEEPSEEK:
+            if not self.deepseek_api_key:
+                raise ValueError("DEEPSEEK_API_KEY is required when PLANNER_PROVIDER=deepseek")
+            _validate_deepseek_base_url(self.deepseek_base_url)
+        if self.planner_timeout_seconds <= 0:
+            raise ValueError("PLANNER_TIMEOUT_SECONDS must be positive")
+        if self.planner_max_attempts < 1:
+            raise ValueError("PLANNER_MAX_ATTEMPTS must be at least 1")
+        if self.planner_max_output_tokens < 1:
+            raise ValueError("PLANNER_MAX_OUTPUT_TOKENS must be positive")
+        if not 1 <= self.planner_max_decisions <= 100:
+            raise ValueError("PLANNER_MAX_DECISIONS must be between 1 and 100")
+        if not 0 <= self.planner_max_invalid_actions <= 20:
+            raise ValueError("PLANNER_MAX_INVALID_ACTIONS must be between 0 and 20")
+        if not 1 <= self.planner_max_repeated_actions <= 20:
+            raise ValueError("PLANNER_MAX_REPEATED_ACTIONS must be between 1 and 20")
+        if not self.replanner_model:
+            raise ValueError("REPLANNER_MODEL must not be blank")
+        if self.replanner_provider is ReplannerProviderMode.OPENAI and not self.openai_api_key:
+            raise ValueError("OPENAI_API_KEY is required when REPLANNER_PROVIDER=openai")
+        if self.replanner_provider is ReplannerProviderMode.DEEPSEEK:
+            if not self.deepseek_api_key:
+                raise ValueError("DEEPSEEK_API_KEY is required when REPLANNER_PROVIDER=deepseek")
+            _validate_deepseek_base_url(self.deepseek_base_url)
+        if self.replanner_timeout_seconds <= 0:
+            raise ValueError("REPLANNER_TIMEOUT_SECONDS must be positive")
+        if self.replanner_max_attempts < 1:
+            raise ValueError("REPLANNER_MAX_ATTEMPTS must be at least 1")
+        if self.replanner_max_output_tokens < 1:
+            raise ValueError("REPLANNER_MAX_OUTPUT_TOKENS must be positive")
+        if not 1 <= self.max_evidence_records <= 10_000:
+            raise ValueError("MAX_EVIDENCE_RECORDS must be between 1 and 10000")
+        if not 1 <= self.max_observation_history <= 100:
+            raise ValueError("MAX_OBSERVATION_HISTORY must be between 1 and 100")
         if self.dev_identity_enabled and (
             not self.dev_tenant_id or not self.dev_user_id
         ):
@@ -610,6 +745,8 @@ class Settings:
             raise ValueError("RUN_BUDGET_PROFILE must not be blank")
         if not 32 <= self.trace_attribute_max_chars <= 2048:
             raise ValueError("TRACE_ATTRIBUTE_MAX_CHARS must be between 32 and 2048")
+        if self.trace_file_enabled and not self.trace_file_dir:
+            raise ValueError("TRACE_FILE_DIR must not be blank when file tracing is enabled")
         self.execution_budget()
         PlanningPolicy(
             poi_query_limit=self.poi_query_limit,
@@ -652,6 +789,12 @@ class Settings:
             max_repeated_fingerprint_count=(
                 self.run_max_repeated_fingerprint_count
             ),
+            max_agent_decisions=self.planner_max_decisions,
+            max_invalid_actions=self.planner_max_invalid_actions,
+            max_evidence_records=self.max_evidence_records,
+            max_observation_history=self.max_observation_history,
+            max_planner_context_tokens=self.max_planner_context_tokens,
+            max_replanner_context_tokens=self.max_replanner_context_tokens,
             deadline_ms=round(self.run_deadline_seconds * 1000),
         )
 

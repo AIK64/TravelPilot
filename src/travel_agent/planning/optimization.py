@@ -2,12 +2,21 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+from itertools import combinations
+import logging
 from time import perf_counter
 from typing import Protocol
 
 from ortools.sat.python import cp_model
 
-from travel_agent.domain.models import Coordinate, PlanStyle, PlanningPOI, TripSpec
+from travel_agent.domain.models import (
+    Coordinate,
+    DayBoundary,
+    PlanStyle,
+    PlanningPOI,
+    StayAnchorResolution,
+    TripSpec,
+)
 from travel_agent.domain.optimization_models import (
     ObjectiveBreakdown,
     ObjectiveWeights,
@@ -22,10 +31,14 @@ from travel_agent.domain.optimization_models import (
 )
 from travel_agent.domain.tool_models import RouteMode, RouteQuery, RouteResult, route_key
 from travel_agent.planning.drafts import CandidateDraft, DraftDay
+from travel_agent.planning.poi_identity import unique_planning_pois
 from travel_agent.planning.routing import haversine_distance_meters
+from travel_agent.planning.stay import derive_day_boundaries, resolve_stay_anchor
 
 
 ANCHOR_ID = "__trip_anchor__"
+logger = logging.getLogger(__name__)
+PROXIMITY_WINDOW_MINUTES = 30
 STYLE_ACTIVITY_LIMITS = {
     PlanStyle.RELAXED: 2,
     PlanStyle.BALANCED: 3,
@@ -101,15 +114,17 @@ def select_optimization_pois(
             poi.facts.id,
         ),
     )
-    return ranked[: budget.candidate_limit]
+    return unique_planning_pois(ranked)[: budget.candidate_limit]
 
 
-def _anchor(trip: TripSpec) -> Coordinate:
-    return (
-        trip.accommodation.coordinate
-        if trip.accommodation is not None
-        else trip.arrival.coordinate
-    )
+def _anchor(
+    trip: TripSpec,
+    stay_resolution: StayAnchorResolution | None = None,
+) -> Coordinate:
+    if trip.day_count == 1:
+        return trip.arrival.coordinate
+    stay = stay_resolution or resolve_stay_anchor(trip, [])
+    return stay.anchor.coordinate if stay.anchor is not None else trip.arrival.coordinate
 
 
 def collect_route_matrix_queries(
@@ -119,10 +134,32 @@ def collect_route_matrix_queries(
     modes: tuple[RouteMode, ...],
     strategy: int,
     max_walking_leg_meters: int,
+    stay_resolution: StayAnchorResolution | None = None,
+    day_boundaries: tuple[DayBoundary, ...] | None = None,
 ) -> list[RouteQuery]:
     queries: list[RouteQuery] = []
-    anchor = _anchor(trip)
-    for destination in pois:
+    seen: set[str] = set()
+    stay = stay_resolution or resolve_stay_anchor(trip, pois)
+    boundaries = day_boundaries or derive_day_boundaries(trip, stay)
+    start_coordinates = {
+        (boundary.start_anchor.coordinate.longitude, boundary.start_anchor.coordinate.latitude):
+        boundary.start_anchor.coordinate
+        for boundary in boundaries
+    }.values()
+    end_coordinates = {
+        (boundary.end_anchor.coordinate.longitude, boundary.end_anchor.coordinate.latitude):
+        boundary.end_anchor.coordinate
+        for boundary in boundaries
+    }.values()
+
+    def append(query: RouteQuery) -> None:
+        key = route_key(query)
+        if key not in seen:
+            seen.add(key)
+            queries.append(query)
+
+    for anchor in start_coordinates:
+      for destination in pois:
         for mode in modes:
             if (
                 mode is RouteMode.WALKING
@@ -133,7 +170,7 @@ def collect_route_matrix_queries(
                 > max_walking_leg_meters * 1.25
             ):
                 continue
-            queries.append(
+            append(
                 RouteQuery(
                     origin=anchor,
                     destination=destination.facts.coordinate,
@@ -156,12 +193,31 @@ def collect_route_matrix_queries(
                     > max_walking_leg_meters * 1.25
                 ):
                     continue
-                queries.append(
+                append(
                     RouteQuery(
                         origin=origin.facts.coordinate,
                         destination=destination.facts.coordinate,
                         origin_poi_id=origin.facts.id,
                         destination_poi_id=destination.facts.id,
+                        mode=mode,
+                        strategy=strategy if mode is RouteMode.DRIVING else 0,
+                    )
+                )
+    for origin in pois:
+        for anchor in end_coordinates:
+            for mode in modes:
+                if (
+                    mode is RouteMode.WALKING
+                    and haversine_distance_meters(
+                        origin.facts.coordinate, anchor
+                    ) > max_walking_leg_meters * 1.25
+                ):
+                    continue
+                append(
+                    RouteQuery(
+                        origin=origin.facts.coordinate,
+                        destination=anchor,
+                        origin_poi_id=origin.facts.id,
                         mode=mode,
                         strategy=strategy if mode is RouteMode.DRIVING else 0,
                     )
@@ -189,6 +245,8 @@ def build_optimization_problem(
     modes: tuple[RouteMode, ...],
     strategy: int,
     max_walking_leg_meters: int,
+    stay_resolution: StayAnchorResolution | None = None,
+    day_boundaries: tuple[DayBoundary, ...] | None = None,
 ) -> OptimizationProblem:
     dates = tuple(
         trip.start_date + timedelta(days=index) for index in range(trip.day_count)
@@ -213,13 +271,39 @@ def build_optimization_problem(
         for poi in pois
     )
     entries: list[RouteMatrixEntry] = []
-    for query in collect_route_matrix_queries(
-        trip,
-        pois,
-        modes=modes,
-        strategy=strategy,
-        max_walking_leg_meters=max_walking_leg_meters,
-    ):
+    anchor = _anchor(trip, stay_resolution)
+    logical_queries: list[RouteQuery] = []
+    for destination in pois:
+        for mode in modes:
+            if mode is RouteMode.WALKING and haversine_distance_meters(
+                anchor, destination.facts.coordinate
+            ) > max_walking_leg_meters * 1.25:
+                continue
+            logical_queries.append(RouteQuery(
+                origin=anchor,
+                destination=destination.facts.coordinate,
+                destination_poi_id=destination.facts.id,
+                mode=mode,
+                strategy=strategy if mode is RouteMode.DRIVING else 0,
+            ))
+    for origin in pois:
+        for destination in pois:
+            if origin.facts.id == destination.facts.id:
+                continue
+            for mode in modes:
+                if mode is RouteMode.WALKING and haversine_distance_meters(
+                    origin.facts.coordinate, destination.facts.coordinate
+                ) > max_walking_leg_meters * 1.25:
+                    continue
+                logical_queries.append(RouteQuery(
+                    origin=origin.facts.coordinate,
+                    destination=destination.facts.coordinate,
+                    origin_poi_id=origin.facts.id,
+                    destination_poi_id=destination.facts.id,
+                    mode=mode,
+                    strategy=strategy if mode is RouteMode.DRIVING else 0,
+                ))
+    for query in logical_queries:
         result = routes[route_key(query)]
         entries.append(
             RouteMatrixEntry(
@@ -304,6 +388,22 @@ class ORToolsOptimizationSolver:
             else:
                 raise ValueError("route matrix pair has no supported mode")
         poi_by_id = {poi.id: poi for poi in problem.pois}
+        # 双向均便捷才奖励同天；这是分组评分，不是实际路线总时间。
+        proximity_pairs = {}
+        for left, right in combinations(problem.pois, 2):
+            forward = matrix.get((left.id, right.id))
+            backward = matrix.get((right.id, left.id))
+            if forward is None or backward is None:
+                continue
+            score = max(0, PROXIMITY_WINDOW_MINUTES - max(
+                forward.duration_minutes, backward.duration_minutes,
+            ))
+            if score:
+                proximity_pairs[(left.id, right.id)] = score
+        logger.info(
+            "optimization.proximity_pairs | problem_id=%s pair_count=%s window_minutes=%s",
+            problem.id, len(proximity_pairs), PROXIMITY_WINDOW_MINUTES,
+        )
         styles = tuple(PlanStyle)[: problem.budget.variant_count]
         solutions: list[OptimizationSolution] = []
         statuses: list[int] = []
@@ -392,6 +492,20 @@ class ORToolsOptimizationSolver:
                     category_vars[(day, category)] = category_var
 
             weights = problem.weights_by_style[style]
+            same_day_vars = {}
+            for (left, right), score in proximity_pairs.items():
+                for day_index, day in enumerate(problem.dates):
+                    together = model.new_bool_var(f"together_{left}_{right}_{day_index}")
+                    left_var = assignments[(left, day)]
+                    right_var = assignments[(right, day)]
+                    model.add(together <= left_var)
+                    model.add(together <= right_var)
+                    model.add(together >= left_var + right_var - 1)
+                    same_day_vars[(left, right, day)] = together
+            proximity_term = weights.proximity * sum(
+                proximity_pairs[(left, right)] * together
+                for (left, right, _day), together in same_day_vars.items()
+            )
             preference_term = sum(
                 weights.preference
                 * poi.preference_value
@@ -414,7 +528,7 @@ class ORToolsOptimizationSolver:
                 for poi in problem.pois
                 for day in problem.dates
             )
-            model.maximize(preference_term + diversity_term - travel_term - cost_term)
+            model.maximize(preference_term + diversity_term + proximity_term - travel_term - cost_term)
 
             solver = cp_model.CpSolver()
             solver.parameters.max_time_in_seconds = per_variant_seconds
@@ -457,12 +571,22 @@ class ORToolsOptimizationSolver:
                     current = poi_id
 
             selected = [poi_by_id[poi_id] for poi_id in selected_ids]
+            proximity_score = sum(
+                proximity_pairs[(left, right)] * solver.value(together)
+                for (left, right, _day), together in same_day_vars.items()
+            )
+            logger.info(
+                "optimization.proximity_assignment | problem_id=%s style=%s score=%s days=%s",
+                problem.id, style.value, proximity_score,
+                [(str(day.date), day.poi_ids) for day in day_assignments],
+            )
             solutions.append(
                 OptimizationSolution(
                     style=style,
                     days=tuple(day_assignments),
                     objective_value=round(solver.objective_value, 3),
                     objective_breakdown=ObjectiveBreakdown(
+                        proximity_score=proximity_score,
                         preference_value=sum(poi.preference_value for poi in selected),
                         diversity_count=len(
                             {category for poi in selected for category in poi.categories}

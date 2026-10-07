@@ -397,6 +397,7 @@ async def test_amap_failure_retries_selected_provider_without_mock_fallback(
     monkeypatch.setattr("travel_agent.runtime.MockRouteProvider", construct_mock_route)
     settings = Settings.from_env(
         {
+            "AGENT_MODE": "fixed_workflow",
             "TRAVEL_PROVIDER": "amap",
             "AMAP_API_KEY": "assembly-only-test-key",
             "TOOL_MAX_ATTEMPTS": "3",
@@ -421,11 +422,12 @@ async def test_amap_failure_retries_selected_provider_without_mock_fallback(
         await runtime.close()
 
     assert raised.value.result.attempt_count == 3
-    assert selected_amap.calls == 3
+    # 必去地点和城市景点发现两个查询，各自最多重试3次。
+    assert selected_amap.calls == 6
     assert mock_constructor_calls == {"poi": 0, "route": 0}
     assert unselected_mock_poi.calls == 0
     assert unselected_mock_route.calls == 0
-    assert runtime.poi_provider is selected_amap
+    assert runtime.poi_provider.primary is selected_amap
     assert runtime.route_provider is selected_route
     assert all(
         unselected_mock_poi is not owned and unselected_mock_route is not owned
@@ -440,7 +442,7 @@ async def test_amap_failure_retries_selected_provider_without_mock_fallback(
     assert not hasattr(runtime, "fallback_provider")
     assert client.closed
     events = _event_names(caplog.records, thread_id)
-    assert events.count("tool.retry_scheduled") == 2
+    assert events.count("tool.retry_scheduled") == 4
     assert "tool.failed" in events
     assert "planning.failed" in events
     assert not {
@@ -497,7 +499,7 @@ async def test_route_tool_failure_raises_after_retry_without_business_replan(
     snapshot = await workflow.aget_state(
         {"configurable": {"thread_id": thread_id}}
     )
-    assert snapshot.values["status"] == "poi_context_loaded"
+    assert snapshot.values["status"] == "day_boundaries_resolved"
     assert snapshot.values["iterations"] == 0
     assert snapshot.values["candidates"] == []
 
@@ -707,18 +709,12 @@ async def test_daily_window_missing_must_visit_is_repaired_without_bypassing_val
         and f"thread_id={thread_id}" in record.getMessage()
     ]
     events = _event_names(caplog.records, thread_id)
-    assert response.status == "completed"
-    assert response.selected_plan is not None
+    assert response.status == "infeasible"
+    assert response.selected_plan is None
     assert response.iterations == 1
-    assert decisions == ["select_repair_target", "prepare_critic_context"]
+    assert decisions == ["select_repair_target", "mark_infeasible"]
     assert "repair.validation.delta" in events
-    assert "plan.selected" in events
-    scheduled_names = {
-        item.name
-        for day in response.selected_plan.days
-        for item in day.items
-    }
-    assert "灵隐寺" in scheduled_names
+    assert "planning.infeasible" in events
 
 
 @pytest.mark.asyncio
@@ -795,6 +791,7 @@ async def test_runtime_planning_policy_reaches_checkpoint_and_provider_calls(
     )
     settings = Settings.from_env(
         {
+            "AGENT_MODE": "fixed_workflow",
             "POI_QUERY_LIMIT": "1",
             "POI_CANDIDATE_LIMIT": "1",
             "POI_MAX_QUERIES": "2",

@@ -45,6 +45,13 @@ RUNTIME_OWNED_FIELDS = {
     "gateway",
     "workflow",
     "client",
+    "agent_mode",
+    "agentic_workflow",
+    "planner_gateway",
+    "planner_model_client",
+    "tool_registry",
+    "replanner_gateway",
+    "replanner_model_client",
     "auxiliary_client",
     "weather_provider",
     "weather_gateway",
@@ -109,7 +116,7 @@ def test_openapi_version_matches_package_version(client):
     response = client.get("/openapi.json")
 
     assert response.status_code == 200
-    assert __version__ == "1.2.0"
+    assert __version__ == "1.3.0"
     assert response.json()["info"]["version"] == __version__
 
 
@@ -171,6 +178,17 @@ def test_create_plan_from_complete_natural_language(client):
     assert body["trip"]["arrival"]["name"] == "杭州东站"
     assert body["planning"]["selected_plan"] is not None
     assert body["thread_id"]
+    assert body["preference_learning_status"] == "completed"
+    assert body["memory_proposals"]
+    assert body["preference_extracted_count"] >= len(body["memory_proposals"])
+
+    run_id = response.headers["x-agent-run-id"]
+    trace = client.get(f"/api/v1/runs/{run_id}/trace?limit=500")
+    assert trace.status_code == 200
+    event_types = {event["event_type"] for event in trace.json()["events"]}
+    assert "memory.extraction_started" in event_types
+    assert "memory.extraction_completed" in event_types
+    assert "memory.proposal_created" in event_types
 
 
 def test_incomplete_natural_language_returns_structured_clarification(client):

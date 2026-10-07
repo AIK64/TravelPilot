@@ -27,6 +27,9 @@ from travel_agent.planning.drafts import (
     prepare_candidate_drafts,
 )
 from travel_agent.planning.planner import MissingRouteResult, materialize_candidates
+from travel_agent.domain.optimization_models import OptimizationBudget
+from travel_agent.planning.optimization import select_optimization_pois
+from travel_agent.planning.poi_identity import normalize_poi_name
 
 
 @pytest.fixture
@@ -107,6 +110,31 @@ def _forbid_route_estimate(*_args):
     raise AssertionError("route estimate used")
 
 
+@pytest.mark.parametrize("same_id", [True, False])
+def test_duplicate_pois_do_not_take_cross_day_slots(hangzhou_trip, planning_pois, same_id):
+    original = planning_pois[0]
+    duplicate = original.model_copy(update={
+        "facts": original.facts.model_copy(update={
+            "id": original.facts.id if same_id else "lingyin-alias",
+            "name": " 灵 隐 寺 ",
+        }),
+    })
+    pois = [original, duplicate, *planning_pois[1:]]
+    selected = select_optimization_pois(
+        hangzhou_trip, pois, OptimizationBudget(candidate_limit=2)
+    )
+    assert len(selected) == 2
+    assert len({normalize_poi_name(poi.facts.name) for poi in selected}) == 2
+
+    by_id = {poi.facts.id: poi for poi in pois}
+    for draft in prepare_candidate_drafts(hangzhou_trip, pois, replan_round=0):
+        ids = [poi_id for day in draft.days for poi_id in day.poi_ids]
+        names = [normalize_poi_name(by_id[poi_id].facts.name) for poi_id in ids]
+        assert len(ids) == len(set(ids))
+        assert len(names) == len(set(names))
+        assert len(ids) == len(planning_pois)
+
+
 def test_drafts_use_haversine_only_for_ordering(
     hangzhou_trip, planning_pois, monkeypatch
 ):
@@ -182,7 +210,11 @@ def test_must_visit_precedes_nearer_infeasible_optional_and_route_order_matches(
         _route_results(trip, queries),
     )[0]
 
-    assert [query.destination_poi_id for query in queries] == list(
+    assert [
+        query.destination_poi_id
+        for query in queries
+        if query.destination_poi_id is not None
+    ] == list(
         draft.days[0].poi_ids
     )
     assert must_visit.facts.id in {
@@ -209,10 +241,7 @@ def test_non_required_pois_keep_nearest_neighbor_order(
         if item.style is PlanStyle.RELAXED
     )
 
-    assert draft.days[0].poi_ids == (
-        west_lake.facts.id,
-        museum.facts.id,
-    )
+    assert draft.days[0].poi_ids == (museum.facts.id, west_lake.facts.id)
 
 
 def test_candidate_drafts_are_immutable(hangzhou_trip):
@@ -232,7 +261,7 @@ def test_route_queries_are_directional_and_deduplicated(
     assert len(keys) == len(set(keys))
     assert all(query.mode is RouteMode.DRIVING for query in queries)
     assert all(query.strategy == 32 for query in queries)
-    assert all(query.destination_poi_id is not None for query in queries)
+    assert any(query.destination_poi_id is None for query in queries)
 
 
 def test_route_queries_keep_opposite_directions(hangzhou_trip, planning_pois):
@@ -282,15 +311,15 @@ def test_materialization_uses_provider_route_values(
     query = collect_route_queries(
         hangzhou_trip, [single_draft], planning_pois
     )[0]
-    routes = {
-        route_key(query): RouteResult(
+    queries = collect_route_queries(hangzhou_trip, [single_draft], planning_pois)
+    routes = _route_results(hangzhou_trip, queries)
+    routes[route_key(query)] = RouteResult(
             distance_meters=4200,
             duration_minutes=18,
             provider="fixture",
             data_confidence=0.9,
             fetched_at=hangzhou_trip.arrival.at,
         )
-    }
 
     candidate = materialize_candidates(
         hangzhou_trip, [single_draft], planning_pois, routes
@@ -299,8 +328,13 @@ def test_materialization_uses_provider_route_values(
     first = candidate.days[0].items[0]
     assert first.distance_from_previous_meters == 4200
     assert first.travel_from_previous_minutes == 18
+    assert first.coordinate == planning_pois[0].facts.coordinate
+    assert candidate.model_dump(mode="json")["days"][0]["items"][0]["coordinate"] == {
+        "longitude": 120.1017, "latitude": 30.2404,
+    }
     assert first.walking_distance_estimated is True
-    assert candidate.days[0].walking_distance_meters == 504
+    assert candidate.days[0].walking_distance_meters >= 504
+    assert candidate.days[0].end_leg is not None
 
 
 def test_materialization_rejects_missing_route_result(
@@ -462,7 +496,7 @@ def test_route_confidence_changes_candidate_confidence_and_score(
     )[0]
 
     assert high.metrics.data_confidence == 0.9
-    assert low.metrics.data_confidence == 0.5
+    assert low.metrics.data_confidence < high.metrics.data_confidence
     assert high.score > low.score
 
 

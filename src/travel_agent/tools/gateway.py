@@ -97,12 +97,13 @@ class ToolGateway:
                 self._execute(
                     cache_key=(
                         f"{provider}|poi|{query.city.casefold()}|"
-                        f"{query.keyword.casefold()}|{query.exact_match}|{query.limit}"
+                        f"{query.keyword.casefold()}|{query.exact_match}|{query.limit}|{query.types}"
                     ),
                     ttl_seconds=self._poi_cache_ttl_seconds,
                     provider=provider,
                     operation="poi.search",
                     context=context,
+                    request=query,
                     call=lambda query=query: self._poi_provider.search_pois(query),
                 )
                 for query in queries
@@ -125,6 +126,7 @@ class ToolGateway:
                     provider=provider,
                     operation=f"route.get_{query.mode.value}",
                     context=context,
+                    request=query,
                     call=(
                         (lambda query=query: self._route_provider.get_walking_route(query))
                         if query.mode is RouteMode.WALKING
@@ -149,9 +151,10 @@ class ToolGateway:
         operation: str,
         context: ToolCallContext,
         call: Callable[[], Awaitable[T]],
+        request: object = None,
     ) -> ToolResult[T]:
         parent_event_id = begin_tool(
-            operation, provider=provider, thread_id=context.thread_id
+            operation, provider=provider, thread_id=context.thread_id, request=request
         )
         self._log_started(context, provider, operation)
 
@@ -242,6 +245,8 @@ class ToolGateway:
             elapsed_ms=result.elapsed_ms,
             error_code=result.error.code if result.error is not None else None,
             parent_event_id=parent_event_id,
+            request=request,
+            result=result,
         )
         return result
 

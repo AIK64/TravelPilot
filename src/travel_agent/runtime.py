@@ -9,11 +9,33 @@ from langgraph.graph.state import CompiledStateGraph
 
 from travel_agent.agents.orchestrator import SpecialistExecutor
 from travel_agent.config import (
+    AgentMode,
     CriticProviderMode,
     EditProviderMode,
+    PlannerProviderMode,
+    ReplannerProviderMode,
     Settings,
     WeatherProviderMode,
 )
+from travel_agent.agents.planner.gateway import PlannerGateway
+from travel_agent.agents.planner.providers.mock import MockPlannerModel
+from travel_agent.agents.planner.providers.openai import OpenAIPlannerModel
+from travel_agent.agents.planner.providers.deepseek import DeepSeekPlannerModel
+from travel_agent.agents.replanner.gateway import ReplannerGateway
+from travel_agent.agents.replanner.providers.mock import MockReplannerModel
+from travel_agent.agents.replanner.providers.openai import OpenAIReplannerModel
+from travel_agent.agents.replanner.providers.deepseek import DeepSeekReplannerModel
+from travel_agent.evidence.repository import InMemoryEvidenceRepository
+from travel_agent.evidence.policy import derive_evidence_gaps
+from travel_agent.agents.actions import AgentPhase
+from travel_agent.agents.context import DynamicPlannerContext, PlannerContextManifest
+from travel_agent.execution.context import current_run_context
+from travel_agent.execution.models import ExecutionUsage
+from travel_agent.memory.models import AgentRole
+from travel_agent.graph.agentic_workflow import build_agentic_workflow, run_agentic_planning
+from travel_agent.tools.agent_executor import AgentToolExecutor
+from travel_agent.tools.registry import default_agent_tool_registry
+from travel_agent.tools.registry import ToolRegistry
 from travel_agent.critique.evidence import EvidenceBudget
 from travel_agent.critique.gateway import CriticGateway
 from travel_agent.critique.protocols import CriticModel
@@ -53,6 +75,8 @@ from travel_agent.lifecycle.repository import PlanRepository, open_plan_reposito
 from travel_agent.lifecycle.service import PlanLifecycleService
 from travel_agent.lifecycle.workflow import build_lifecycle_workflow
 from travel_agent.planning.defaults import POIDefaultPolicy
+from travel_agent.planning.kernel import PlanningKernelService
+from travel_agent.planning.quality import QualityReviewService
 from travel_agent.planning.policy import PlanningPolicy
 from travel_agent.tools.gateway import ToolGateway, build_gateway
 from travel_agent.tools.protocols import POIProvider, RouteProvider
@@ -62,6 +86,7 @@ from travel_agent.tools.providers.amap import (
     AMapRouteProvider,
 )
 from travel_agent.tools.providers.mock import MockPOIProvider, MockRouteProvider
+from travel_agent.tools.providers.qunar import QunarScenicPOIProvider
 from travel_agent.requirements.gateway import RequirementGateway
 from travel_agent.requirements.checkpoints import open_requirement_checkpointer
 from travel_agent.requirements.models import (
@@ -102,6 +127,36 @@ from travel_agent.memory.repository import (
 from travel_agent.memory.service import PreferenceMemoryService
 
 
+async def _run_shadow_decision(
+    planner_gateway: PlannerGateway,
+    registry: ToolRegistry,
+    request: PlanningRequest,
+    *,
+    thread_id: str,
+) -> str:
+    """只记录影子动作，不分发 Tool，也不让影子结果进入计划状态。"""
+    gaps = derive_evidence_gaps(request.trip, ())
+    tools = registry.manifest(role=AgentRole.PLANNER, phase=AgentPhase.RESEARCHING)
+    run = current_run_context()
+    usage = run.ledger.snapshot() if run is not None else ExecutionUsage()
+    context = DynamicPlannerContext(
+        goal=request.trip,
+        phase=AgentPhase.RESEARCHING,
+        evidence_gaps=gaps,
+        evidence_catalog=(),
+        recent_observations=(),
+        tool_manifest=tools,
+        budget_remaining=usage,
+        context_manifest=PlannerContextManifest(
+            tool_names=tuple(item.name for item in tools),
+        ),
+    )
+    decision = await planner_gateway.decide(
+        context, thread_id=f"{thread_id}:shadow", decision_round=1
+    )
+    return decision.action.kind
+
+
 @dataclass(slots=True)
 class PlanningRuntime:
     """持有一套显式选定、由应用生命周期共享的规划依赖。"""
@@ -111,6 +166,10 @@ class PlanningRuntime:
     gateway: ToolGateway
     workflow: CompiledStateGraph
     client: httpx.AsyncClient | None
+    agent_mode: AgentMode = AgentMode.DYNAMIC_PLANNER
+    agentic_workflow: CompiledStateGraph | None = None
+    planner_gateway: PlannerGateway | None = None
+    tool_registry: ToolRegistry | None = None
     auxiliary_client: httpx.AsyncClient | None = None
     weather_provider: WeatherProvider | None = None
     weather_gateway: WeatherToolGateway | None = None
@@ -118,6 +177,9 @@ class PlanningRuntime:
     requirement_gateway: RequirementGateway | None = None
     requirement_workflow: CompiledStateGraph | None = None
     model_client: Any | None = None
+    planner_model_client: Any | None = None
+    replanner_model_client: Any | None = None
+    replanner_gateway: ReplannerGateway | None = None
     critic_model: CriticModel | None = None
     critic_gateway: CriticGateway | None = None
     critic_model_client: Any | None = None
@@ -147,8 +209,11 @@ class PlanningRuntime:
         tool_cache_enabled: bool = True,
     ) -> "PlanningRuntime":
         settings.validate()
+        agent_mode = settings.effective_agent_mode
         client: httpx.AsyncClient | None = None
         model_client: Any | None = None
+        planner_model_client: Any | None = None
+        replanner_model_client: Any | None = None
         critic_model_client: Any | None = None
         edit_model_client: Any | None = None
         auxiliary_client: httpx.AsyncClient | None = None
@@ -190,7 +255,8 @@ class PlanningRuntime:
                 route_provider: RouteProvider = MockRouteProvider()
             elif settings.provider is ProviderMode.AMAP:
                 assert amap_client is not None
-                poi_provider = AMapPOIProvider(amap_client)
+                assert client is not None
+                poi_provider = QunarScenicPOIProvider(AMapPOIProvider(amap_client), client)
                 route_provider = AMapRouteProvider(amap_client)
             else:
                 assert baidu_client is not None
@@ -319,9 +385,7 @@ class PlanningRuntime:
                 max_soft_replan_rounds=settings.max_soft_replan_rounds,
                 grounding_max_attempts=settings.critic_grounding_max_attempts,
             )
-            specialist_executor = SpecialistExecutor(
-                max_handoffs=settings.agent_max_handoffs
-            )
+            specialist_executor = None
             workflow = build_workflow(
                 gateway,
                 defaults,
@@ -333,7 +397,7 @@ class PlanningRuntime:
                     max_input_chars=settings.critic_max_input_chars
                 ),
                 evaluation_overrides=evaluation_overrides,
-                agent_mode=settings.agent_mode,
+                agent_mode=agent_mode,
                 specialist_executor=specialist_executor,
             )
             if settings.requirement_provider is RequirementProviderMode.MOCK:
@@ -396,6 +460,135 @@ class PlanningRuntime:
                 context_max_tokens=settings.memory_context_max_tokens,
                 context_max_characters=settings.memory_context_max_characters,
             )
+            agentic_workflow: CompiledStateGraph | None = None
+            planner_gateway: PlannerGateway | None = None
+            tool_registry: ToolRegistry | None = None
+            if agent_mode in {
+                AgentMode.DYNAMIC_PLANNER,
+                AgentMode.SHADOW_DYNAMIC_PLANNER,
+            }:
+                tool_registry = default_agent_tool_registry()
+                if settings.planner_provider is PlannerProviderMode.MOCK:
+                    planner_model = MockPlannerModel()
+                else:
+                    try:
+                        from openai import AsyncOpenAI
+                    except ImportError as error:
+                        raise RuntimeError(
+                            "Install the llm-openai extra to use a remote planner"
+                        ) from error
+                    if settings.planner_provider is PlannerProviderMode.OPENAI:
+                        assert settings.openai_api_key is not None
+                        planner_model_client = AsyncOpenAI(
+                            api_key=settings.openai_api_key,
+                            timeout=settings.planner_timeout_seconds,
+                            max_retries=0,
+                        )
+                        planner_model = OpenAIPlannerModel(
+                            client=planner_model_client,
+                            model=settings.planner_model,
+                        )
+                    else:
+                        assert settings.deepseek_api_key is not None
+                        planner_model_client = AsyncOpenAI(
+                            api_key=settings.deepseek_api_key,
+                            base_url=settings.deepseek_base_url,
+                            timeout=settings.planner_timeout_seconds,
+                            max_retries=0,
+                        )
+                        planner_model = DeepSeekPlannerModel(
+                            client=planner_model_client,
+                            model=settings.planner_model,
+                            max_tokens=settings.planner_max_output_tokens,
+                        )
+                planner_gateway = PlannerGateway(
+                    model=planner_model,
+                    timeout_seconds=settings.planner_timeout_seconds,
+                    max_attempts=settings.planner_max_attempts,
+                )
+                replanner_gateway: ReplannerGateway | None = None
+                if settings.replanner_provider is ReplannerProviderMode.MOCK:
+                    replanner_model = MockReplannerModel()
+                elif settings.replanner_provider in {
+                    ReplannerProviderMode.OPENAI,
+                    ReplannerProviderMode.DEEPSEEK,
+                }:
+                    from openai import AsyncOpenAI
+                    if settings.replanner_provider is ReplannerProviderMode.OPENAI:
+                        assert settings.openai_api_key is not None
+                        replanner_model_client = AsyncOpenAI(api_key=settings.openai_api_key, timeout=settings.replanner_timeout_seconds, max_retries=0)
+                        replanner_model = OpenAIReplannerModel(client=replanner_model_client, model=settings.replanner_model)
+                    else:
+                        assert settings.deepseek_api_key is not None
+                        replanner_model_client = AsyncOpenAI(api_key=settings.deepseek_api_key, base_url=settings.deepseek_base_url, timeout=settings.replanner_timeout_seconds, max_retries=0)
+                        replanner_model = DeepSeekReplannerModel(client=replanner_model_client, model=settings.replanner_model, max_tokens=settings.replanner_max_output_tokens)
+                else:
+                    replanner_model = None
+                if replanner_model is not None:
+                    replanner_gateway = ReplannerGateway(
+                        model=replanner_model,
+                        timeout_seconds=settings.replanner_timeout_seconds,
+                        max_attempts=settings.replanner_max_attempts,
+                    )
+                planning_kernel = PlanningKernelService(
+                    gateway=gateway,
+                    defaults=defaults,
+                    policy=policy,
+                    optimization_budget=optimization_budget,
+                )
+                agentic_workflow = build_agentic_workflow(
+                    planning_kernel=planning_kernel,
+                    planner_gateway=planner_gateway,
+                    tool_executor=AgentToolExecutor(
+                        registry=tool_registry,
+                        gateway=gateway,
+                        defaults=defaults,
+                        planning_policy=policy,
+                        optimization_budget=optimization_budget,
+                        weather_gateway=weather_gateway,
+                        preference_service=preference_service,
+                    ),
+                    evidence_repository=InMemoryEvidenceRepository(
+                        max_records_per_run=settings.max_evidence_records
+                    ),
+                    max_observation_history=settings.max_observation_history,
+                    max_invalid_actions=settings.planner_max_invalid_actions,
+                    replanner_gateway=replanner_gateway,
+                    quality_service=QualityReviewService(
+                        critic_gateway=critic_gateway,
+                        policy=critic_policy,
+                        evidence_budget=EvidenceBudget(
+                            max_input_chars=settings.critic_max_input_chars
+                        ),
+                    ),
+                    max_planner_context_tokens=settings.max_planner_context_tokens,
+                )
+            else:
+                replanner_gateway = None
+
+            async def selected_planning_runner(
+                request: PlanningRequest, thread_id: str
+            ) -> PlanningResponse:
+                if (
+                    agent_mode is AgentMode.DYNAMIC_PLANNER
+                    and agentic_workflow is not None
+                ):
+                    return await run_agentic_planning(
+                        agentic_workflow, request, thread_id=thread_id
+                    )
+                if agent_mode is AgentMode.SHADOW_DYNAMIC_PLANNER:
+                    assert planner_gateway is not None and tool_registry is not None
+                    shadow_action = await _run_shadow_decision(
+                        planner_gateway, tool_registry, request, thread_id=thread_id
+                    )
+                    response = await run_planning(workflow, request, thread_id=thread_id)
+                    return response.model_copy(update={
+                        "agent_mode": AgentMode.SHADOW_DYNAMIC_PLANNER.value,
+                        "decision_count": 1,
+                        "action_summary": (shadow_action,),
+                    })
+                return await run_planning(workflow, request, thread_id=thread_id)
+
             checkpoint_context = open_requirement_checkpointer(settings)
             requirement_checkpointer = await checkpoint_context.__aenter__()
             checkpoint_entered = True
@@ -403,6 +596,7 @@ class PlanningRuntime:
                 requirement_gateway=requirement_gateway,
                 tool_gateway=gateway,
                 planning_workflow=workflow,
+                planning_runner=selected_planning_runner,
                 memory_service=preference_service,
                 checkpointer=requirement_checkpointer,
             )
@@ -487,7 +681,13 @@ class PlanningRuntime:
             )
             lifecycle_service = PlanLifecycleService(
                 repository=plan_repository,
-                planning_workflow=workflow,
+                planning_workflow=(
+                    agentic_workflow
+                    if agent_mode is AgentMode.DYNAMIC_PLANNER
+                    and agentic_workflow is not None
+                    else workflow
+                ),
+                planning_runner=selected_planning_runner,
                 lifecycle_workflow=lifecycle_workflow,
                 requirement_workflow=requirement_workflow,
                 weather_stale_max_seconds=settings.weather_stale_max_seconds,
@@ -503,6 +703,7 @@ class PlanningRuntime:
                 run_repository,
                 settings.execution_budget(),
                 trace_attribute_max_chars=settings.trace_attribute_max_chars,
+                trace_file_dir=settings.trace_file_dir if settings.trace_file_enabled else None,
                 config_values={
                     "budget": settings.execution_budget().model_dump(mode="json"),
                     "travel_provider": settings.provider.value,
@@ -510,7 +711,7 @@ class PlanningRuntime:
                     "critic_provider": settings.critic_provider.value,
                     "edit_provider": settings.edit_provider.value,
                     "weather_provider": settings.weather_provider.value,
-                    "agent_mode": settings.agent_mode.value,
+                    "agent_mode": agent_mode.value,
                     "memory_store": settings.memory_store_backend.value,
                 },
             )
@@ -520,6 +721,10 @@ class PlanningRuntime:
                 gateway=gateway,
                 workflow=workflow,
                 client=client,
+                agent_mode=agent_mode,
+                agentic_workflow=agentic_workflow,
+                planner_gateway=planner_gateway,
+                tool_registry=tool_registry,
                 auxiliary_client=auxiliary_client,
                 weather_provider=weather_provider,
                 weather_gateway=weather_gateway,
@@ -527,6 +732,9 @@ class PlanningRuntime:
                 requirement_gateway=requirement_gateway,
                 requirement_workflow=requirement_workflow,
                 model_client=model_client,
+                planner_model_client=planner_model_client,
+                replanner_model_client=replanner_model_client,
+                replanner_gateway=replanner_gateway,
                 critic_model=critic_model,
                 critic_gateway=critic_gateway,
                 critic_model_client=critic_model_client,
@@ -560,6 +768,14 @@ class PlanningRuntime:
                 await checkpoint_context.__aexit__(None, None, None)
             if model_client is not None:
                 await model_client.close()
+            if planner_model_client is not None and planner_model_client is not model_client:
+                await planner_model_client.close()
+            if (
+                replanner_model_client is not None
+                and replanner_model_client is not model_client
+                and replanner_model_client is not planner_model_client
+            ):
+                await replanner_model_client.close()
             if (
                 critic_model_client is not None
                 and critic_model_client is not model_client
@@ -580,6 +796,17 @@ class PlanningRuntime:
     async def close(self) -> None:
         if self.model_client is not None:
             await self.model_client.close()
+        if (
+            self.planner_model_client is not None
+            and self.planner_model_client is not self.model_client
+        ):
+            await self.planner_model_client.close()
+        if (
+            self.replanner_model_client is not None
+            and self.replanner_model_client is not self.model_client
+            and self.replanner_model_client is not self.planner_model_client
+        ):
+            await self.replanner_model_client.close()
         if (
             self.critic_model_client is not None
             and self.critic_model_client is not self.model_client
@@ -622,7 +849,7 @@ class PlanningRuntime:
         principal: Principal | None = None,
         precreated: bool = False,
     ) -> ExecutionResult[PlanningResponse]:
-        call = lambda: run_planning(self.workflow, request, thread_id=thread_id)
+        call = lambda: self._run_selected_planning(request, thread_id=thread_id)
         if self.run_coordinator is None:
             return ExecutionResult(payload=await call(), run=None)
         return await self.run_coordinator.execute(
@@ -637,6 +864,29 @@ class PlanningRuntime:
             precreated=precreated,
         )
 
+    async def _run_selected_planning(
+        self, request: PlanningRequest, *, thread_id: str
+    ) -> PlanningResponse:
+        if (
+            self.agent_mode is AgentMode.DYNAMIC_PLANNER
+            and self.agentic_workflow is not None
+        ):
+            return await run_agentic_planning(
+                self.agentic_workflow, request, thread_id=thread_id
+            )
+        if self.agent_mode is AgentMode.SHADOW_DYNAMIC_PLANNER:
+            if self.planner_gateway is None or self.tool_registry is None:
+                raise RuntimeError("shadow planner is not configured")
+            shadow_action = await _run_shadow_decision(
+                self.planner_gateway, self.tool_registry, request, thread_id=thread_id
+            )
+            response = await run_planning(self.workflow, request, thread_id=thread_id)
+            return response.model_copy(update={
+                "agent_mode": AgentMode.SHADOW_DYNAMIC_PLANNER.value,
+                "decision_count": 1,
+                "action_summary": (shadow_action,),
+            })
+        return await run_planning(self.workflow, request, thread_id=thread_id)
     async def reserve_plan_run(
         self,
         *,
@@ -652,6 +902,35 @@ class PlanningRuntime:
             run_id=run_id,
             thread_id=thread_id,
             request_id=request_id,
+            tenant_id=principal.tenant_id,
+            user_id=principal.user_id,
+        )
+
+    async def reserve_run(
+        self,
+        kind: RunKind,
+        *,
+        run_id: str,
+        thread_id: str,
+        principal: Principal,
+        request_id: str | None = None,
+        causation_id: str | None = None,
+    ) -> AgentRunRecord:
+        """在流式响应返回 run_id 前创建可查询的 Run。"""
+        if self.run_coordinator is None:
+            raise RuntimeError("run coordinator is not configured")
+        parent_run_id = (
+            await self._latest_run_id(thread_id=thread_id)
+            if kind is RunKind.CLARIFICATION_RESUME
+            else None
+        )
+        return await self.run_coordinator.reserve(
+            kind,
+            run_id=run_id,
+            thread_id=thread_id,
+            request_id=request_id,
+            parent_run_id=parent_run_id,
+            causation_id=causation_id,
             tenant_id=principal.tenant_id,
             user_id=principal.user_id,
         )
@@ -678,6 +957,8 @@ class PlanningRuntime:
         principal: Principal | None = None,
         fault_plan: FaultPlan | None = None,
         budget: ExecutionBudget | None = None,
+        run_id: str | None = None,
+        precreated: bool = False,
     ) -> ExecutionResult[NaturalPlanningResponse]:
         if self.requirement_workflow is None:
             raise RuntimeError("natural-language planning is not configured")
@@ -697,6 +978,10 @@ class PlanningRuntime:
             thread_id=thread_id,
             fault_plan=fault_plan,
             budget=budget,
+            run_id=run_id,
+            tenant_id=identity.tenant_id,
+            user_id=identity.user_id,
+            precreated=precreated,
         )
 
     async def resume_from_text(
@@ -720,6 +1005,8 @@ class PlanningRuntime:
         thread_id: str,
         principal: Principal | None = None,
         fault_plan: FaultPlan | None = None,
+        run_id: str | None = None,
+        precreated: bool = False,
     ) -> ExecutionResult[NaturalPlanningResponse]:
         if self.requirement_workflow is None:
             raise RuntimeError("natural-language planning is not configured")
@@ -744,10 +1031,16 @@ class PlanningRuntime:
             thread_id=thread_id,
             request_id=str(request.request_id),
             causation_id=request.interrupt_id,
-            parent_run_id=await self._latest_run_id(thread_id=thread_id),
+            parent_run_id=(
+                None
+                if precreated
+                else await self._latest_run_id(thread_id=thread_id)
+            ),
             fault_plan=fault_plan,
             tenant_id=identity.tenant_id,
             user_id=identity.user_id,
+            run_id=run_id,
+            precreated=precreated,
         )
 
     async def create_plan_session(
@@ -830,6 +1123,35 @@ class PlanningRuntime:
             fault_plan=fault_plan,
             tenant_id=identity.tenant_id,
             user_id=identity.user_id,
+        )
+
+    async def execute_create_plan_session_from_checkpoint(
+        self,
+        *,
+        thread_id: str,
+        session_id: str,
+        source_run_id: str,
+        principal: Principal,
+    ) -> ExecutionResult[PlanSessionResponse]:
+        if self.lifecycle_service is None:
+            raise RuntimeError("plan lifecycle is not configured")
+        call = lambda: self.lifecycle_service.create_from_checkpoint(
+            thread_id,
+            session_id=session_id,
+            tenant_id=principal.tenant_id,
+            user_id=principal.user_id,
+        )
+        if self.run_coordinator is None:
+            return ExecutionResult(payload=await call(), run=None)
+        return await self.run_coordinator.execute(
+            RunKind.LIFECYCLE_CREATE,
+            call,
+            session_id=session_id,
+            thread_id=f"lifecycle:{session_id}",
+            request_id=f"selection:{source_run_id}",
+            parent_run_id=source_run_id,
+            tenant_id=principal.tenant_id,
+            user_id=principal.user_id,
         )
 
     async def resume_plan_session(

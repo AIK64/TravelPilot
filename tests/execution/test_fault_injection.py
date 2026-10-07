@@ -113,7 +113,10 @@ async def test_plan_repository_fault_has_repository_terminal_reason():
 
 @pytest.mark.asyncio
 async def test_empty_poi_result_is_business_outcome_not_provider_failure():
-    runtime = await PlanningRuntime.create(Settings.from_env({}))
+    # 该断言验证旧固定基线的业务失败分类，而不是生产默认模式。
+    runtime = await PlanningRuntime.create(
+        Settings.from_env({"AGENT_MODE": "fixed_workflow"})
+    )
     trip = TripSpec.model_validate_json(
         (ROOT / "evals" / "repairs" / "base_trip.json").read_text(
             encoding="utf-8"

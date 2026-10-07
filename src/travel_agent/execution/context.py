@@ -60,7 +60,7 @@ def match_fault(
     return context.faults.match(point, operation=operation, attempt=attempt)
 
 
-def begin_tool(operation: str, *, provider: str, thread_id: str) -> str | None:
+def begin_tool(operation: str, *, provider: str, thread_id: str, request: object = None) -> str | None:
     context = current_run_context()
     if context is None:
         return None
@@ -70,6 +70,7 @@ def begin_tool(operation: str, *, provider: str, thread_id: str) -> str | None:
         status="started",
         operation=operation,
         attributes={"provider": provider, "thread_id": thread_id},
+        file_details={"request": request} if request is not None else None,
     )
     return event.event_id if event else None
 
@@ -122,6 +123,8 @@ def finish_tool(
     elapsed_ms: float | None,
     error_code: str | None,
     parent_event_id: str | None,
+    request: object = None,
+    result: object = None,
 ) -> None:
     context = current_run_context()
     if context is None:
@@ -147,6 +150,7 @@ def finish_tool(
             "attempt_count": attempt_count,
             "error_code": error_code,
         },
+        file_details={"request": request, "result": result} if result is not None else None,
     )
 
 
@@ -299,3 +303,98 @@ def record_degradation(reason: str) -> None:
             status="degraded",
             attributes={"reason": reason},
         )
+
+
+def record_stay_resolution(
+    *, mode: str, confidence: float, confirmed: bool, candidate_count: int
+) -> None:
+    context = current_run_context()
+    if context is not None:
+        context.trace.record(
+            TraceEventType.STAY_ANCHOR_RESOLVED,
+            status="resolved",
+            operation="resolve_stay_anchor",
+            attributes={
+                "mode": mode,
+                "confidence": confidence,
+                "confirmed": confirmed,
+                "candidate_count": candidate_count,
+            },
+        )
+
+
+def record_day_boundaries(
+    *, day_count: int, start_role: str, end_role: str
+) -> None:
+    context = current_run_context()
+    if context is not None:
+        context.trace.record(
+            TraceEventType.DAY_BOUNDARIES_RESOLVED,
+            status="resolved",
+            operation="derive_day_boundaries",
+            attributes={
+                "day_count": day_count,
+                "start_role": start_role,
+                "end_role": end_role,
+            },
+        )
+
+
+def record_memory_event(
+    event_type: TraceEventType,
+    *,
+    status: str,
+    operation: str,
+    attributes: dict[str, str | int | float | bool | None] | None = None,
+) -> None:
+    context = current_run_context()
+    if context is not None:
+        context.trace.record(
+            event_type,
+            status=status,
+            operation=operation,
+            attributes=attributes,
+        )
+
+
+def record_agent_event(
+    event_type: TraceEventType,
+    *,
+    status: str,
+    operation: str,
+    attributes: dict[str, str | int | float | bool | None] | None = None,
+    file_details: dict[str, object] | None = None,
+) -> None:
+    """记录经过白名单裁剪的动态 Agent 事件，不写入 Prompt 或正文。"""
+    context = current_run_context()
+    if context is not None:
+        context.trace.record(
+            event_type,
+            status=status,
+            operation=operation,
+            attributes=attributes,
+            file_details=file_details,
+            terminal=event_type
+            in {
+                TraceEventType.FINAL_GUARD_COMPLETED,
+                TraceEventType.AGENT_NO_PROGRESS,
+            },
+        )
+
+
+def consume_agent_decision() -> None:
+    context = current_run_context()
+    if context is not None:
+        context.ledger.consume_agent_decision()
+
+
+def consume_invalid_action() -> None:
+    context = current_run_context()
+    if context is not None:
+        context.ledger.consume_invalid_action()
+
+
+def consume_evidence_record() -> None:
+    context = current_run_context()
+    if context is not None:
+        context.ledger.consume_evidence_record()
